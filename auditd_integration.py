@@ -27,6 +27,7 @@ Usage:
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -36,6 +37,29 @@ from pathlib import Path
 log = logging.getLogger("auditd")
 
 AUDIT_RULE_PREFIX = "artifact_watch"
+
+
+def _find_auditctl() -> str | None:
+    """Find the auditctl binary, checking both PATH and /usr/sbin."""
+    path = shutil.which("auditctl")
+    if path:
+        return path
+    # Check /usr/sbin (common for audit tools)
+    sbin_path = "/usr/sbin/auditctl"
+    if os.path.isfile(sbin_path) and os.access(sbin_path, os.X_OK):
+        return sbin_path
+    return None
+
+
+def _find_ausearch() -> str | None:
+    """Find the ausearch binary, checking both PATH and /usr/sbin."""
+    path = shutil.which("ausearch")
+    if path:
+        return path
+    sbin_path = "/usr/sbin/ausearch"
+    if os.path.isfile(sbin_path) and os.access(sbin_path, os.X_OK):
+        return sbin_path
+    return None
 
 
 @dataclass
@@ -56,21 +80,28 @@ class AuditdResolver:
 
     def __init__(self):
         self._rule_key = f"{AUDIT_RULE_PREFIX}_{os.getpid()}"
+        self._auditctl = _find_auditctl()
+        self._ausearch = _find_ausearch()
 
     def is_available(self) -> bool:
         """Check if auditd is installed and the audit daemon is running."""
+        if self._auditctl is None:
+            log.info("auditctl not found — auditd not installed")
+            return False
         # Check if auditctl exists
         try:
             result = subprocess.run(
-                ["auditctl", "-s"],
+                [self._auditctl, "-s"],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0 and "enabled" in result.stdout.lower():
                 return True
-            # auditctl exists but auditd might not be running
-            if "Permission denied" in result.stderr:
-                log.warning("auditctl requires root/sudo. Run as root or configure sudoers.")
-                return False
+            # auditctl exists but needs root — still consider available
+            output = result.stdout + result.stderr
+            if "root" in output.lower() or "permission denied" in output.lower():
+                log.info("auditd is installed but requires root. Run collector with sudo.")
+                # We consider it available since it works when run as root
+                return True
         except FileNotFoundError:
             log.info("auditctl not found — auditd not installed")
             return False
@@ -96,7 +127,7 @@ class AuditdResolver:
             # Remove any existing rules for this path first
             self._remove_watch_for_path(path)
 
-            cmd = ["auditctl", "-w", path, "-p", "rwxa", "-k", self._rule_key]
+            cmd = [self._auditctl, "-w", path, "-p", "rwxa", "-k", self._rule_key]
             try:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=10,
@@ -118,7 +149,7 @@ class AuditdResolver:
             return
         try:
             result = subprocess.run(
-                ["auditctl", "-l"], capture_output=True, text=True, timeout=5,
+                [self._auditctl, "-l"], capture_output=True, text=True, timeout=5,
             )
             for line in result.stdout.splitlines():
                 if self._rule_key in line and path in line:
@@ -126,7 +157,7 @@ class AuditdResolver:
                     if len(parts) >= 2:
                         watched_path = parts[1]
                         subprocess.run(
-                            ["auditctl", "-W", watched_path, "-p", "rwxa", "-k", self._rule_key],
+                            [self._auditctl, "-W", watched_path, "-p", "rwxa", "-k", self._rule_key],
                             capture_output=True, timeout=5,
                         )
                         log.info("Audit rule removed: %s", watched_path)
@@ -143,7 +174,7 @@ class AuditdResolver:
         try:
             # List current rules and delete ours
             result = subprocess.run(
-                ["auditctl", "-l"], capture_output=True, text=True, timeout=5,
+                [self._auditctl, "-l"], capture_output=True, text=True, timeout=5,
             )
             for line in result.stdout.splitlines():
                 if self._rule_key in line:
@@ -153,7 +184,7 @@ class AuditdResolver:
                     if len(parts) >= 2:
                         path = parts[1]
                         subprocess.run(
-                            ["auditctl", "-W", path, "-p", "rwxa", "-k", self._rule_key],
+                            [self._auditctl, "-W", path, "-p", "rwxa", "-k", self._rule_key],
                             capture_output=True, timeout=5,
                         )
                         log.info("Audit rule removed: %s", path)
@@ -190,7 +221,7 @@ class AuditdResolver:
         try:
             result = subprocess.run(
                 [
-                    "ausearch", "-k", self._rule_key,
+                    self._ausearch, "-k", self._rule_key,
                     "-ts", "today",
                     "-i",
                 ],
@@ -201,9 +232,8 @@ class AuditdResolver:
             return None
 
         if result.returncode != 0 or not result.stdout.strip():
-            log.debug("ausearch returned no output (rc=%d, stderr=%s)", result.returncode, result.stderr.strip())
+            log.debug("ausearch returned no output (rc=%d)", result.returncode)
             return None
-
         return self._parse_audit_events(result.stdout, target_path)
 
     def find_process_for_event(self, event_time: str, target_path: str) -> AuditProcessContext | None:
@@ -218,7 +248,7 @@ class AuditdResolver:
         try:
             result = subprocess.run(
                 [
-                    "ausearch", "-k", self._rule_key,
+                    self._ausearch, "-k", self._rule_key,
                     "-ts", event_time,
                     "-te", event_time,
                     "-i",
@@ -237,81 +267,54 @@ class AuditdResolver:
     def _parse_audit_events(self, raw_output: str, target_path: str) -> AuditProcessContext | None:
         """Parse ausearch output and extract process context for the target file.
 
-        Audit event format (with -i flag):
-            type=SYSCALL msg=audit(1234567890.123:456): arch=x86_64 syscall=openat
-                success=yes exit=3 a0=ffffff9c ... pid=1234 uid=1000 ...
-                comm=\"curl\" exe=\"/usr/bin/curl\"
-            type=CWD msg=audit(...): cwd=\"/home/kali\"
-            type=PATH msg=audit(...): item=0 name=\"/home/kali/.aws/config\" ...
-            type=PROCTITLE msg=audit(...): proctitle=\"curl https://...\"
+        Uses a state-machine approach: builds event blocks from audit records.
+        Each audit event consists of multiple record types:
+            type=SYSCALL → contains PID, UID, comm, exe, syscall
+            type=CWD     → current working directory
+            type=PATH    → accessed file paths
+            type=PROCTITLE → full command line
+        Events are separated by '----' lines.
         """
         lines = raw_output.splitlines()
         log.debug("parse_audit_events: raw line count=%d", len(lines))
-        for i, raw_line in enumerate(lines[:5]):
-            log.debug("  raw[%d]: %s", i, raw_line[:200])
 
-        current_event = {}
+        # Parse all audit events by splitting on '----' separators
+        # and grouping records within each event block
         events = []
-        num_syscall = 0
-        num_path = 0
-        num_other = 0
+        current_records = []
 
         for line in lines:
-            line = line.strip()
-            if not line:
+            stripped = line.strip()
+            if not stripped:
                 continue
+            if stripped == "----":
+                # End of an event block — process it
+                if current_records:
+                    parsed = self._parse_event_block(current_records)
+                    if parsed:
+                        events.append(parsed)
+                    current_records = []
+            else:
+                current_records.append(stripped)
 
-            # Parse SYSCALL line — contains PID, UID, comm, exe
-            if "type=SYSCALL" in line:
-                num_syscall += 1
-                # Start a new event block
-                if current_event and current_event.get("paths"):
-                    events.append(current_event)
-                current_event = {"syscall": {}, "paths": []}
+        # Don't forget the last block (no trailing ----)
+        if current_records:
+            parsed = self._parse_event_block(current_records)
+            if parsed:
+                events.append(parsed)
 
-                # Extract fields
-                pid = self._extract_field(line, "pid")
-                uid = self._extract_field(line, "uid")
-                comm = self._extract_quoted(line, "comm")
-                exe = self._extract_quoted(line, "exe")
-                syscall = self._extract_field(line, "syscall")
-                timestamp = self._extract_timestamp(line)
-
-                if pid:
-                    current_event["syscall"] = {
-                        "pid": int(pid),
-                        "uid": self._parse_uid(uid),
-                        "comm": comm or "unknown",
-                        "exe": exe,
-                        "syscall": syscall,
-                        "timestamp": timestamp,
-                    }
-
-            # Parse PATH line — contains accessed file
-            elif "type=PATH" in line:
-                num_path += 1
-                name = self._extract_quoted(line, "name")
-                if name:
-                    current_event.setdefault("paths", []).append(name)
-
-            # Parse PROCTITLE — contains full command line
-            elif "type=PROCTITLE" in line:
-                proctitle = self._extract_quoted(line, "proctitle")
-                if proctitle and current_event.get("syscall"):
-                    current_event["syscall"]["exe"] = proctitle
-
-        # Don't forget the last event
-        if current_event and current_event.get("paths"):
-            events.append(current_event)
-
-        log.debug("ausearch lines: total=%d SYSCALL=%d PATH=%d other=%d", len(raw_output.splitlines()), num_syscall, num_path, num_other)
+        log.debug("Parsed %d events from ausearch, target='%s'", len(events), target_path)
 
         # Find the event that matches our target path
-        log.debug("Parsed %d events from ausearch, target='%s'", len(events), target_path)
         for event in reversed(events):  # Most recent first
             sc = event.get("syscall", {})
             # Skip auditd's own rule-installation events
             if sc.get("comm") in ("auditctl", "audispd", "auditd"):
+                log.debug("Skipping auditd's own event (comm=%s)", sc.get("comm"))
+                continue
+            # Skip events with no PID (shouldn't happen but be safe)
+            if not sc.get("pid"):
+                log.debug("Skipping event with no PID")
                 continue
             event_paths = event.get("paths", [])
             matched = any(
@@ -319,13 +322,12 @@ class AuditdResolver:
                 for p in event_paths
             )
             if matched:
-                # Resolve username from UID
                 username = self._uid_to_name(sc.get("uid"))
-
+                log.info("Resolved process: pid=%s comm=%s user=%s", sc.get("pid"), sc.get("comm"), username)
                 return AuditProcessContext(
                     pid=sc["pid"],
                     comm=sc["comm"],
-                    ppid=None,  # Audit doesn't directly provide PPID
+                    ppid=None,
                     uid=sc["uid"],
                     username=username,
                     syscall=sc.get("syscall"),
@@ -336,6 +338,59 @@ class AuditdResolver:
                 log.debug("Event paths %s don't match target '%s' (comm=%s)", event_paths, target_path, sc.get('comm'))
 
         return None
+
+    def _parse_event_block(self, records: list[str]) -> dict | None:
+        """Parse a single audit event block (records between ---- separators).
+
+        Returns dict with 'syscall' info and 'paths' list, or None if invalid.
+        """
+        syscall_info = None
+        paths = []
+        proctitle = None
+        cwd = None
+
+        for record in records:
+            if record.startswith("type=SYSCALL"):
+                pid = self._extract_field(record, "pid")
+                uid = self._extract_field(record, "uid")
+                comm = self._extract_quoted(record, "comm")
+                exe = self._extract_quoted(record, "exe")
+                syscall = self._extract_field(record, "syscall")
+                timestamp = self._extract_timestamp(record)
+
+                syscall_info = {
+                    "pid": int(pid) if pid else None,
+                    "uid": self._parse_uid(uid),
+                    "comm": comm or "unknown",
+                    "exe": exe,
+                    "syscall": syscall,
+                    "timestamp": timestamp,
+                }
+
+            elif record.startswith("type=CWD"):
+                cwd = self._extract_quoted(record, "cwd")
+
+            elif record.startswith("type=PATH"):
+                name = self._extract_quoted(record, "name")
+                if name:
+                    # Audit PATH names can be relative ("config") or absolute
+                    # ("/home/debian/.azure/config"). Combine with CWD if relative.
+                    if not name.startswith("/") and cwd:
+                        name = cwd.rstrip("/") + "/" + name
+                    paths.append(name)
+
+            elif record.startswith("type=PROCTITLE"):
+                proctitle = self._extract_quoted(record, "proctitle")
+
+        if not syscall_info or not paths:
+            log.debug("Skipping event block: syscall=%s paths=%s", bool(syscall_info), paths)
+            return None
+
+        # PROCTITLE gives the full command line — prefer it over comm
+        if proctitle:
+            syscall_info["exe"] = proctitle
+
+        return {"syscall": syscall_info, "paths": paths}
 
     def _extract_field(self, line: str, field: str) -> str | None:
         """Extract a numeric field from an audit log line.
@@ -357,16 +412,25 @@ class AuditdResolver:
         if match:
             return match.group(1)
         # Try unquoted - value is everything up to the next space or end of line
-        match = re.search(rf'{field}=(\S+)', line)
+        match = re.search(rf'\b{field}=(\S+)', line)
         return match.group(1) if match else None
 
     def _extract_timestamp(self, line: str) -> str | None:
         """Extract timestamp from audit message header.
 
-        Matches: msg=audit(1234567890.123:456)
+        Handles both formats:
+          Without -i: msg=audit(1234567890.123:456)
+          With -i:    msg=audit(21/08/26 22:07:21.674:290)
         """
+        # Try numeric timestamp format (without -i)
         match = re.search(r'msg=audit\((\d+\.\d+):\d+\)', line)
-        return match.group(1) if match else None
+        if match:
+            return match.group(1)
+        # Try human-readable format (with -i)
+        match = re.search(r'msg=audit\(([^)]+)\)', line)
+        if match:
+            return match.group(1)
+        return None
 
     def _parse_uid(self, uid_str: str | None) -> int:
         """Parse UID from ausearch -i output.
