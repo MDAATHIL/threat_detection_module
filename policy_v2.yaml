@@ -1,0 +1,26 @@
+version: 1
+monitoring:
+- path: ~/.azure
+  type: directory
+  recursive: true
+  category: cloud_credentials
+
+- path: ~/.aws
+  type: directory
+  recursive: true
+  category: cloud_credentials
+
+- path: ~/.ssh
+  type: directory
+  recursive: true
+  category: authentication
+
+- path: ~/.kube
+  type: directory
+  recursive: true
+  category: cloud_credentials
+
+- path: ~/.steampipe
+  type: directory
+  recursive: true
+  category: database_credentials

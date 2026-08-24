@@ -1,6 +1,6 @@
 version: 1
 monitoring:
-- path: /home/debian/.azure
+- path: ~/.azure
   type: directory
   recursive: true
   category: user_defined

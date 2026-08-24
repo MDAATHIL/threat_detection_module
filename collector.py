@@ -19,6 +19,8 @@ import logging
 import os
 import sys
 import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -47,14 +49,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("collector")
 
-POLICY_PATH = Path(__file__).parent / "policy.yaml"
+POLICY_PATH = Path(__file__).parent / "policy_v2.yaml"
 
 
 def load_policy() -> list[dict[str, Any]]:
-    """Load monitoring targets from policy.yaml."""
+    """Load monitoring targets from policy.yaml.
+    Paths containing ~ are expanded to the current user's home directory.
+    """
     with open(POLICY_PATH) as f:
         policy = yaml.safe_load(f)
-    return policy.get("monitoring", [])
+    targets = policy.get("monitoring", [])
+    # Expand ~ to the actual home directory
+    for t in targets:
+        if "path" in t:
+            t["path"] = str(Path(t["path"]).expanduser())
+    return targets
 
 
 def _map_event_type(event) -> str:
@@ -71,14 +80,26 @@ def _map_event_type(event) -> str:
 
 
 class ArtifactHandler(FileSystemEventHandler):
-    """Receives inotify events, resolves process context, and logs to SQLite."""
+    """Receives inotify events, resolves process context, and logs to SQLite.
+    
+    Tracks timing patterns to detect burst/frequency-based attacks.
+    """
 
+    # Session threshold: events within this many seconds are grouped
+    SESSION_TIMEOUT = 5.0  # seconds
+    BURST_THRESHOLD = 0.5  # seconds - events faster than this = burst
+    
     def __init__(self, watched_paths: set[str], resolver=None, fallback=None):
         super().__init__()
         self.watched_paths = watched_paths
         self.resolver = resolver  # AuditdResolver or ProcScanner
         self.fallback = fallback  # ProcScanner as fallback when auditd returns nothing
         self.use_auditd = isinstance(resolver, AuditdResolver)
+        # Session tracking for burst detection
+        self._last_event_time: float = 0.0
+        self._session_id: str | None = None
+        self._session_file_count: int = 0
+        self._session_start_time: float = 0.0
 
     def _matches_artifact(self, path: str) -> str | None:
         """Check if an event path falls under a monitored artifact.
@@ -91,6 +112,35 @@ class ArtifactHandler(FileSystemEventHandler):
             if path.startswith(watched + "/") or path.startswith(watched + os.sep):
                 return watched
         return None
+
+    def _update_session(self) -> tuple[float | None, str, int]:
+        """Track session for burst detection.
+        
+        Returns:
+            (time_delta, session_id, files_in_session)
+        """
+        now = time.time()
+        time_delta = None
+        
+        if self._last_event_time > 0:
+            time_delta = now - self._last_event_time
+            
+            # Start new session if too much time has passed
+            if time_delta > self.SESSION_TIMEOUT:
+                self._session_id = str(uuid.uuid4())[:8]
+                self._session_file_count = 1
+                self._session_start_time = now
+            else:
+                # Continue existing session
+                self._session_file_count += 1
+        else:
+            # First event ever
+            self._session_id = str(uuid.uuid4())[:8]
+            self._session_file_count = 1
+            self._session_start_time = now
+        
+        self._last_event_time = now
+        return time_delta, self._session_id, self._session_file_count
 
     def on_any_event(self, event):
         """Called for every inotify event."""
@@ -121,6 +171,9 @@ class ArtifactHandler(FileSystemEventHandler):
         else:
             ctx = self.resolver.scan_for_file(src)
 
+        # Track timing for burst detection
+        time_delta, session_id, files_in_session = self._update_session()
+
         row_id = insert_event(
             artifact_path=artifact,
             access_type=access_type,
@@ -130,31 +183,31 @@ class ArtifactHandler(FileSystemEventHandler):
             parent_process_name=ctx.parent_comm if ctx else None,
             user_id=ctx.uid if ctx else None,
             username=ctx.username if ctx else None,
+            time_delta=time_delta,
+            session_id=session_id,
+            files_in_session=files_in_session,
         )
 
-        if ctx:
-            proc_info = (
-                f"pid={ctx.pid} ppid={ctx.ppid} comm={ctx.comm}"
-                f" parent={ctx.parent_comm} user={ctx.username}"
-            )
-        else:
-            proc_info = "no process found"
+        proc_info = f"pid={ctx.pid} comm={ctx.comm} user={ctx.username}" if ctx else "no process found"
+        burst_info = f"delta={time_delta:.3f}s" if time_delta else "first_event"
         log.info(
-            "Event #%d: %s on %s (artifact=%s, %s)",
+            "Event #%d: %s on %s (artifact=%s, %s, session=%s, %s)",
             row_id,
             access_type,
             src if src != dest else f"{src} -> {dest}",
             artifact,
             proc_info,
+            session_id,
+            burst_info,
         )
 
 
 def build_watch_list(targets: list[dict]) -> list[tuple[Path, bool]]:
     """Build (path, recursive) pairs from policy targets.
-    Validates each path exists on disk."""
+    Validates each path exists on disk. Paths with ~ are expanded automatically."""
     watch_list = []
     for t in targets:
-        path = Path(t["path"])
+        path = Path(t["path"]).expanduser()
         recursive = t.get("recursive", False)
         if not path.exists():
             log.warning("Skipping non-existent path: %s", path)
