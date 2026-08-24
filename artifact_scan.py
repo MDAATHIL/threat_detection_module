@@ -6,7 +6,7 @@ import yaml
 from pathlib import Path
 
 
-OUTPUT_FILE = "policy.yaml"
+OUTPUT_FILE = "policy_v2.yaml"
 
 
 class FileBrowser:

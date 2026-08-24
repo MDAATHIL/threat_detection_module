@@ -1,0 +1,26 @@
+version: 1
+monitoring:
+- path: /home/debian/.azure
+  type: directory
+  recursive: true
+  category: cloud_credentials
+
+- path: /home/debian/.aws
+  type: directory
+  recursive: true
+  category: cloud_credentials
+
+- path: /home/debian/.ssh
+  type: directory
+  recursive: true
+  category: authentication
+
+- path: /home/debian/.kube
+  type: directory
+  recursive: true
+  category: cloud_credentials
+
+- path: /home/debian/.steampipe
+  type: directory
+  recursive: true
+  category: database_credentials

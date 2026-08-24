@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("collector")
 
-POLICY_PATH = Path(__file__).parent / "policy.yaml"
+POLICY_PATH = Path(__file__).parent / "policy_v2.yaml"
 
 
 def load_policy() -> list[dict[str, Any]]:
