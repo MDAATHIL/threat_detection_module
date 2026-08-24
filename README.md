@@ -1,1 +1,1 @@
-Threat Detection and Defense
+Threat Detection and Defense Training
