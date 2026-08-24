@@ -37,6 +37,7 @@ from pathlib import Path
 log = logging.getLogger("auditd")
 
 AUDIT_RULE_PREFIX = "artifact_watch"
+AUDIT_RULE_KEY = "artifact_watch_all"  # Shared key for all collector instances
 
 
 def _find_auditctl() -> str | None:
@@ -68,6 +69,7 @@ class AuditProcessContext:
     pid: int
     comm: str
     ppid: int | None
+    parent_comm: str | None  # parent process name (not always available from audit)
     uid: int
     username: str
     syscall: str | None
@@ -79,9 +81,19 @@ class AuditdResolver:
     """Manages audit rules and reads audit events for process resolution."""
 
     def __init__(self):
-        self._rule_key = f"{AUDIT_RULE_PREFIX}_{os.getpid()}"
+        self._rule_key = AUDIT_RULE_KEY
         self._auditctl = _find_auditctl()
         self._ausearch = _find_ausearch()
+
+    def _run_audit(self, cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+        """Run an audit command with sudo."""
+        return subprocess.run(
+            ["sudo"] + cmd,
+            capture_output=kwargs.pop("capture_output", True),
+            text=kwargs.pop("text", True),
+            timeout=kwargs.pop("timeout", 10),
+            **kwargs,
+        )
 
     def is_available(self) -> bool:
         """Check if auditd is installed and the audit daemon is running."""
@@ -90,10 +102,7 @@ class AuditdResolver:
             return False
         # Check if auditctl exists
         try:
-            result = subprocess.run(
-                [self._auditctl, "-s"],
-                capture_output=True, text=True, timeout=5,
-            )
+            result = self._run_audit([self._auditctl, "-s"], timeout=5)
             if result.returncode == 0 and "enabled" in result.stdout.lower():
                 return True
             # auditctl exists but needs root — still consider available
@@ -129,9 +138,7 @@ class AuditdResolver:
 
             cmd = [self._auditctl, "-w", path, "-p", "rwxa", "-k", self._rule_key]
             try:
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=10,
-                )
+                result = self._run_audit(cmd)
                 if result.returncode == 0:
                     log.info("Audit rule added: %s", path)
                 else:
@@ -148,17 +155,15 @@ class AuditdResolver:
         if not self.is_available():
             return
         try:
-            result = subprocess.run(
-                [self._auditctl, "-l"], capture_output=True, text=True, timeout=5,
-            )
+            result = self._run_audit([self._auditctl, "-l"], timeout=5)
             for line in result.stdout.splitlines():
                 if self._rule_key in line and path in line:
                     parts = line.split()
                     if len(parts) >= 2:
                         watched_path = parts[1]
-                        subprocess.run(
+                        self._run_audit(
                             [self._auditctl, "-W", watched_path, "-p", "rwxa", "-k", self._rule_key],
-                            capture_output=True, timeout=5,
+                            timeout=5,
                         )
                         log.info("Audit rule removed: %s", watched_path)
         except Exception as e:
@@ -169,23 +174,17 @@ class AuditdResolver:
         if not self.is_available():
             return
 
-        cmd = ["auditctl", "-d", "-w", "/", "-p", "rwxa", "-k", self._rule_key]
-        # Simpler: delete all rules with our key
+        # Delete all rules with our key
         try:
-            # List current rules and delete ours
-            result = subprocess.run(
-                [self._auditctl, "-l"], capture_output=True, text=True, timeout=5,
-            )
+            result = self._run_audit([self._auditctl, "-l"], timeout=5)
             for line in result.stdout.splitlines():
                 if self._rule_key in line:
-                    # Parse the rule to delete it
-                    # Rules look like: -w /path -p rwxa -k key
                     parts = line.split()
                     if len(parts) >= 2:
                         path = parts[1]
-                        subprocess.run(
+                        self._run_audit(
                             [self._auditctl, "-W", path, "-p", "rwxa", "-k", self._rule_key],
-                            capture_output=True, timeout=5,
+                            timeout=5,
                         )
                         log.info("Audit rule removed: %s", path)
         except Exception as e:
@@ -219,13 +218,12 @@ class AuditdResolver:
         """Single ausearch query for the target path."""
         # Use --start today to avoid -ts recent missing very new events
         try:
-            result = subprocess.run(
+            result = self._run_audit(
                 [
                     self._ausearch, "-k", self._rule_key,
                     "-ts", "today",
                     "-i",
                 ],
-                capture_output=True, text=True, timeout=10,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
             log.warning("ausearch error: %s", e)
@@ -246,14 +244,13 @@ class AuditdResolver:
             return None
 
         try:
-            result = subprocess.run(
+            result = self._run_audit(
                 [
                     self._ausearch, "-k", self._rule_key,
                     "-ts", event_time,
                     "-te", event_time,
                     "-i",
                 ],
-                capture_output=True, text=True, timeout=10,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
             log.warning("ausearch error: %s", e)
@@ -328,6 +325,7 @@ class AuditdResolver:
                     pid=sc["pid"],
                     comm=sc["comm"],
                     ppid=None,
+                    parent_comm=None,
                     uid=sc["uid"],
                     username=username,
                     syscall=sc.get("syscall"),
