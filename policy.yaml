@@ -1,14 +1,6 @@
 version: 1
 monitoring:
-- path: /home/kali/.aws
-  type: directory
-  recursive: true
-  category: user_defined
-- path: /home/kali/.azure
-  type: directory
-  recursive: true
-  category: user_defined
-- path: /home/kali/.ssh
+- path: /home/debian/.azure
   type: directory
   recursive: true
   category: user_defined

@@ -185,15 +185,18 @@ def start_collector():
     proc_scanner = ProcScanner()
     auditd = AuditdResolver()
     if auditd.is_available():
-        log.info("Using auditd + /proc fallback for process resolution")
         # Add audit rules for all monitored paths
         paths_to_watch = [str(p) for p, _ in watch_list]
         if auditd.add_watches(paths_to_watch):
+            log.info("Using auditd + /proc fallback for process resolution")
             log.info("Audit rules installed for %d path(s)", len(paths_to_watch))
+            resolver = auditd
+            fallback = proc_scanner
         else:
-            log.warning("Some audit rules failed — /proc fallback will be used for those paths")
-        resolver = auditd
-        fallback = proc_scanner
+            log.warning("auditd rules failed (need root) — using /proc scanning")
+            log.info("For zero-gap detection: sudo python collector.py")
+            resolver = proc_scanner
+            fallback = None
     else:
         log.info("auditd not available — using /proc scanning (race condition possible)")
         log.info("For zero-gap detection: sudo apt install auditd && sudo systemctl start auditd")

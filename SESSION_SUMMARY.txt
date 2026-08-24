@@ -1,7 +1,7 @@
 ================================================================================
 PROJECT: Behavior-Based Threat Detection for Compromised Linux Servers
 SESSION: Initial MVP — Context Collector + Baseline Engine
-DATE:    2026-08-21
+DATE:    2026-08-24
 ================================================================================
 
 OVERVIEW
@@ -17,9 +17,10 @@ ARCHITECTURE (Current)
          |
   collector.py  (watchdog/inotify)  <-- reads policy.yaml for paths
          |
-  proc_scanner.py  (scan /proc/*/fd/ for process context)
+  auditd_integration.py  (primary: kernel-level audit, zero race condition)
+  proc_scanner.py        (fallback: /proc scan, race-prone)
          |
-    SQLite (events table)  — now with PID, process, user fields
+    SQLite (events table)  — PID, process, user fields populated
          |
   baseline.py   (computes profiles by artifact+user+process)
          |
@@ -29,17 +30,16 @@ ARCHITECTURE (Current)
 
 FILE STRUCTURE
 --------------
-/home/kali/project/
-├── policy.yaml            — Artifact definitions (paths to monitor)
-├── artifact_scan.py       — TUI file browser for selecting artifacts to monitor
-├── requirements.txt       — Dependencies: watchdog>=4.0, pyyaml>=6.0
-├── db.py                  — SQLite schema + helper functions (insert_event, upsert_baseline)
-├── proc_scanner.py        — /proc-based process resolver (fallback)
-├── auditd_integration.py  — auditd-based process resolver (production-grade)
-├── collector.py           — inotify collector + auditd/proc process resolution
-├── baseline.py            — Computes normal behavior profiles from collected events
-├── collector.db           — SQLite database (events + baseline tables) [created at runtime]
-└── venv/                  — Python virtual environment (watchdog 6.0.0 installed)
+policy.yaml            — Artifact definitions (paths to monitor)
+artifact_scan.py       — TUI file browser for selecting artifacts to monitor
+requirements.txt       — Dependencies: watchdog>=4.0, pyyaml>=6.0
+db.py                  — SQLite schema + helper functions (insert_event, upsert_baseline)
+proc_scanner.py        — /proc-based process resolver (fallback)
+auditd_integration.py  — auditd-based process resolver (production-grade, sudo)
+collector.py           — inotify collector + auditd/proc process resolution
+baseline.py            — Computes normal behavior profiles from collected events
+collector.db           — SQLite database (events + baseline tables) [created at runtime]
+venv/                  — Python virtual environment (watchdog 6.0.0 installed)
 
 DEPENDENCIES
 ------------
@@ -47,6 +47,8 @@ DEPENDENCIES
 - watchdog 6.0.0 (inotify-based filesystem monitoring)
 - pyyaml 6.0.3 (YAML parsing for policy.yaml)
 - sqlite3 (stdlib, no install needed)
+- auditd + audispd-plugins (kernel-level audit, requires sudo)
+- Sudoers configured: debian ALL=(root) NOPASSWD: /usr/sbin/auditctl, /usr/sbin/ausearch
 
 DATABASE SCHEMA (db.py)
 -----------------------
@@ -55,12 +57,12 @@ Table: events
   timestamp       TEXT NOT NULL          -- ISO-8601 UTC
   artifact_path   TEXT NOT NULL          -- which sensitive path was accessed
   access_type     TEXT NOT NULL          -- read, write, create, delete, moved
-  pid             INTEGER               -- populated via /proc scan
-  process_name    TEXT                  -- populated via /proc scan
-  ppid            INTEGER               -- populated via /proc scan
-  parent_process_name TEXT              -- populated via /proc scan
-  user_id         INTEGER               -- populated via /proc scan
-  username        TEXT                  -- populated via /proc scan
+  pid             INTEGER               -- populated via auditd or /proc
+  process_name    TEXT                  -- populated via auditd or /proc
+  ppid            INTEGER               -- populated via /proc
+  parent_process_name TEXT              -- populated via /proc
+  user_id         INTEGER               -- populated via auditd or /proc
+  username        TEXT                  -- populated via auditd or /proc
   INDEXES: idx_events_artifact, idx_events_timestamp, idx_events_user
 
 Table: baseline
@@ -79,7 +81,6 @@ Table: baseline
 HOW TO RUN
 ----------
 # 1. Activate environment
-cd /home/kali/project
 source venv/bin/activate
 
 # 2. Define what to monitor (TUI browser)
@@ -93,7 +94,7 @@ python artifact_scan.py
 python collector.py
 
 # 4. In another terminal, generate some events (writes are detected)
-echo "# update" >> /home/kali/.aws/config
+echo "# update" >> /home/debian/.azure/config
 
 # 5. Compute baseline
 python baseline.py          # compute and show
@@ -104,14 +105,9 @@ POLICY.YAML FORMAT
 ------------------
 version: 1
 monitoring:
-- path: /home/kali/.aws
+- path: /home/debian/.azure
   type: directory
   recursive: true
-  category: user_defined
-
-- path: /home/kali/.aws/credentials
-  type: file
-  recursive: false
   category: user_defined
 
 PROC_SCANNER.PY DETAILS
@@ -122,27 +118,38 @@ PROC_SCANNER.PY DETAILS
 - Fills in PID, process name, parent process, user fields
 - Race condition: quick open/close (e.g. cat file) may not be caught
 - For sustained access (tail, curl, ssh), detection is reliable
+- Also supports scan_for_paths() for multi-target efficiency
 
 AUDITD_INTEGRATION.PY DETAILS
 -----------------------------
-- Uses auditctl to add file watch rules (kernel-level)
-- Uses ausearch to read audit events (zero race condition)
-- Parses audit log output to extract PID, process, user, syscall, exe
-- On each inotify event, queries audit logs for matching record
+- Uses auditctl (via sudo) to add file watch rules (kernel-level)
+- Uses ausearch (via sudo) to read audit events (zero race condition)
+- Shared audit key: "artifact_watch_all" (all collector instances use same key)
+- Uses _run_audit() helper that prefixes all commands with sudo
+- Parses audit log output using state-machine:
+  * Splits on '----' separators into event blocks
+  * Groups SYSCALL, CWD, PATH, PROCTITLE records per event
+  * Extracts PID, process name, UID, syscall, exe from SYSCALL records
+  * Resolves relative PATH names using CWD
+  * Skips auditd's own events (auditctl, audispd, auditd processes)
+- Retries up to 5 times with 0.5s delays (auditd may not flush immediately)
 - Detects if auditd is installed and running (graceful fallback)
-- Cleans up audit rules on collector shutdown
+- Cleans up audit rules on collector shutdown (remove_watches)
+- Handles both quoted and unquoted ausearch field formats
+- Handles numeric and username UID formats (-i flag)
 
 COLLECTOR.PY DETAILS
 --------------------
 - Loads monitoring targets from policy.yaml
 - Uses watchdog Observer + inotify to watch paths
 - At startup, checks if auditd is available:
-  * If yes: installs audit rules, uses AuditdResolver
-  * If no: falls back to ProcScanner (/proc scanning)
+  * If yes AND rules install successfully: uses AuditdResolver as primary
+  * If rules fail (no sudo): falls back to ProcScanner (/proc scanning)
+  * If auditd not installed: uses ProcScanner only
 - On any filesystem event:
   * Maps watchdog event type to access_type (read/write/create/delete/moved)
-  * Matches event path against monitored artifacts
-  * Resolves process via auditd or /proc (whichever is available)
+  * Matches event path against monitored artifacts (prefix matching)
+  * Resolves process: auditd first, then /proc fallback if auditd returns None
   * Inserts event into SQLite with full process/user context
 - On shutdown: removes audit rules if auditd was used
 
@@ -161,35 +168,34 @@ BASELINE.PY DETAILS
 CURRENT STATUS
 --------------
 COMPLETED:
-  ✅ policy.yaml — artifact definitions
+  ✅ policy.yaml — artifact definitions (currently monitoring /home/debian/.azure)
   ✅ artifact_scan.py — TUI policy generator
   ✅ requirements.txt — dependencies pinned
   ✅ db.py — SQLite schema + helpers
-  ✅ proc_scanner.py — /proc-based process resolver
-  ✅ collector.py — inotify collector + /proc process resolution
+  ✅ proc_scanner.py — /proc-based process resolver (with scan_for_file + scan_for_paths)
+  ✅ auditd_integration.py — auditd-based process resolver (production-grade, sudo)
+  ✅ collector.py — inotify collector with auditd+proc dual resolution + fallback
   ✅ baseline.py — behavior profile engine
   ✅ End-to-end pipeline tested and working
+  ✅ auditd PID resolution working (bash, cat, python3 all resolved correctly)
 
 KNOWN LIMITATIONS:
-  ⚠️  auditd not installed — collector falls back to /proc scanning.
-      Install: sudo apt install auditd audispd-plugins
   ⚠️  No anomaly detection yet — events are logged but not scored.
   ⚠️  No sequence analysis — individual events are tracked, not patterns.
   ⚠️  No risk scoring — no way to flag suspicious activity yet.
-  ⚠️  Policy only covers .aws — .ssh, .azure, .kube, .steampipe not added.
+  ⚠️  Policy only covers .azure — .aws, .ssh, .kube, .steampipe not added.
 
 NEXT STEPS (for next session)
 ------------------------------
-1. Install auditd for zero-gap process resolution
-2. Build anomaly detector that compares events against baseline
-3. Implement risk scoring (explainable, per-event)
-4. Add sequence analysis for multi-step attack patterns
-5. Expand policy.yaml to cover more artifact categories
-6. Add alerting/reporting for high-risk events
+1. Build anomaly detector that compares events against baseline
+2. Implement risk scoring (explainable, per-event)
+3. Add sequence analysis for multi-step attack patterns
+4. Expand policy.yaml to cover more artifact categories
+5. Add alerting/reporting for high-risk events
 
 DESIGN PRINCIPLES
 -----------------
-1. Context over content — accessing .aws/credentials isn't inherently malicious;
+1. Context over content — accessing .azure/config isn't inherently malicious;
    who, when, and in what sequence determines risk.
 2. Explainability — risk scores must be interpretable, not black-box.
 3. Low false-positive rate — production apps legitimately touch these files.
