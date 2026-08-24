@@ -132,7 +132,13 @@ class ArtifactHandler(FileSystemEventHandler):
             username=ctx.username if ctx else None,
         )
 
-        proc_info = f"pid={ctx.pid} comm={ctx.comm} user={ctx.username}" if ctx else "no process found"
+        if ctx:
+            proc_info = (
+                f"pid={ctx.pid} ppid={ctx.ppid} comm={ctx.comm}"
+                f" parent={ctx.parent_comm} user={ctx.username}"
+            )
+        else:
+            proc_info = "no process found"
         log.info(
             "Event #%d: %s on %s (artifact=%s, %s)",
             row_id,

@@ -12,3 +12,7 @@ monitoring:
   type: directory
   recursive: true
   category: user_defined
+- path: /home/kali/Music
+  type: directory
+  recursive: true
+  category: user_defined

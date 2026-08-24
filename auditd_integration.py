@@ -44,6 +44,7 @@ class AuditProcessContext:
     pid: int
     comm: str
     ppid: int | None
+    parent_comm: str | None
     uid: int
     username: str
     syscall: str | None
@@ -181,17 +182,23 @@ class AuditdResolver:
                 return ctx
             if attempt < 4:
                 time.sleep(0.5)
-        log.debug("No audit event found for %s after 5 attempts", target_path)
+        # Diagnostic: dump raw ausearch output on first miss to help debug
+        if not hasattr(self, '_debug_shown'):
+            self._debug_shown = True
+            self._query_audit_debug(target_path)
+        log.info("No audit event found for %s after 5 attempts (key=%s)", target_path, self._rule_key)
         return None
 
     def _query_audit(self, target_path: str) -> AuditProcessContext | None:
         """Single ausearch query for the target path."""
-        # Use --start today to avoid -ts recent missing very new events
+        # Use -ts recent (last 10 min) to avoid midnight boundary issues
+        # with -ts today. The inotify event fires within seconds of access
+        # so 10 minutes is more than enough.
         try:
             result = subprocess.run(
                 [
                     "ausearch", "-k", self._rule_key,
-                    "-ts", "today",
+                    "-ts", "recent",
                     "-i",
                 ],
                 capture_output=True, text=True, timeout=10,
@@ -205,6 +212,23 @@ class AuditdResolver:
             return None
 
         return self._parse_audit_events(result.stdout, target_path)
+
+    def _query_audit_debug(self, target_path: str) -> None:
+        """Diagnostic: dump raw ausearch output at INFO level."""
+        try:
+            result = subprocess.run(
+                ["ausearch", "-k", self._rule_key, "-ts", "recent", "-i"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.stdout.strip():
+                lines = result.stdout.strip().splitlines()
+                log.info("[auditd-debug] ausearch returned %d lines for key=%s", len(lines), self._rule_key)
+                for line in lines[:20]:
+                    log.info("[auditd-debug] %s", line[:250])
+            else:
+                log.info("[auditd-debug] ausearch returned empty output (rc=%d stderr=%s)", result.returncode, result.stderr.strip()[:200])
+        except Exception as e:
+            log.info("[auditd-debug] ausearch exception: %s", e)
 
     def find_process_for_event(self, event_time: str, target_path: str) -> AuditProcessContext | None:
         """Find process for a specific event by timestamp.
@@ -244,41 +268,40 @@ class AuditdResolver:
             type=CWD msg=audit(...): cwd=\"/home/kali\"
             type=PATH msg=audit(...): item=0 name=\"/home/kali/.aws/config\" ...
             type=PROCTITLE msg=audit(...): proctitle=\"curl https://...\"
+
+        NOTE: ausearch -i may output records in any order (PATH before SYSCALL
+        is common). We use a two-pass approach: first collect all records by
+        event ID, then find the matching event.
         """
         lines = raw_output.splitlines()
         log.debug("parse_audit_events: raw line count=%d", len(lines))
         for i, raw_line in enumerate(lines[:5]):
             log.debug("  raw[%d]: %s", i, raw_line[:200])
 
-        current_event = {}
-        events = []
-        num_syscall = 0
-        num_path = 0
-        num_other = 0
+        # --- Pass 1: collect records grouped by event ID ---
+        # Event ID is the numeric part in msg=audit(EPOCH:ID)
+        events: dict[str, dict] = {}  # event_id -> {syscall, paths, cwd}
 
         for line in lines:
             line = line.strip()
             if not line:
                 continue
 
-            # Parse SYSCALL line — contains PID, UID, comm, exe
-            if "type=SYSCALL" in line:
-                num_syscall += 1
-                # Start a new event block
-                if current_event and current_event.get("paths"):
-                    events.append(current_event)
-                current_event = {"syscall": {}, "paths": []}
+            event_id = self._extract_event_id(line)
+            if event_id is None:
+                continue
 
-                # Extract fields
+            event = events.setdefault(event_id, {"syscall": None, "paths": [], "cwd": None})
+
+            if "type=SYSCALL" in line:
                 pid = self._extract_field(line, "pid")
                 uid = self._extract_field(line, "uid")
                 comm = self._extract_quoted(line, "comm")
                 exe = self._extract_quoted(line, "exe")
                 syscall = self._extract_field(line, "syscall")
                 timestamp = self._extract_timestamp(line)
-
                 if pid:
-                    current_event["syscall"] = {
+                    event["syscall"] = {
                         "pid": int(pid),
                         "uid": self._parse_uid(uid),
                         "comm": comm or "unknown",
@@ -287,53 +310,73 @@ class AuditdResolver:
                         "timestamp": timestamp,
                     }
 
-            # Parse PATH line — contains accessed file
             elif "type=PATH" in line:
-                num_path += 1
                 name = self._extract_quoted(line, "name")
                 if name:
-                    current_event.setdefault("paths", []).append(name)
+                    event["paths"].append(name)
 
-            # Parse PROCTITLE — contains full command line
+            elif "type=CWD" in line:
+                cwd = self._extract_quoted(line, "cwd")
+                if cwd:
+                    event["cwd"] = cwd
+
             elif "type=PROCTITLE" in line:
                 proctitle = self._extract_quoted(line, "proctitle")
-                if proctitle and current_event.get("syscall"):
-                    current_event["syscall"]["exe"] = proctitle
+                if proctitle and event.get("syscall"):
+                    event["syscall"]["exe"] = proctitle
 
-        # Don't forget the last event
-        if current_event and current_event.get("paths"):
-            events.append(current_event)
+        log.debug("ausearch lines: total=%d events=%d", len(lines), len(events))
 
-        log.debug("ausearch lines: total=%d SYSCALL=%d PATH=%d other=%d", len(raw_output.splitlines()), num_syscall, num_path, num_other)
-
-        # Find the event that matches our target path
-        log.debug("Parsed %d events from ausearch, target='%s'", len(events), target_path)
-        for event in reversed(events):  # Most recent first
-            sc = event.get("syscall", {})
+        # --- Pass 2: find the event matching our target path ---
+        event_list = list(events.values())
+        log.info("[auditd-debug] Parsed %d events from ausearch, target='%s'", len(event_list), target_path)
+        for event in reversed(event_list):  # Most recent first
+            sc = event.get("syscall")
+            if sc is None:
+                continue
             # Skip auditd's own rule-installation events
             if sc.get("comm") in ("auditctl", "audispd", "auditd"):
                 continue
+
             event_paths = event.get("paths", [])
+            cwd = event.get("cwd")
+
+            # Resolve relative paths against CWD so we can match them
+            resolved_paths = []
+            for p in event_paths:
+                if os.path.isabs(p):
+                    resolved_paths.append(p)
+                elif cwd:
+                    resolved_paths.append(os.path.normpath(os.path.join(cwd, p)))
+                else:
+                    resolved_paths.append(p)  # keep as-is if no CWD
+
             matched = any(
                 target_path == p or target_path in p or p in target_path
-                for p in event_paths
+                for p in resolved_paths
             )
+            log.info("[auditd-debug] Event pid=%s comm=%s cwd=%s paths=%s resolved=%s matched=%s",
+                     sc.get('pid'), sc.get('comm'), cwd, event_paths, resolved_paths, matched)
             if matched:
                 # Resolve username from UID
                 username = self._uid_to_name(sc.get("uid"))
 
-                return AuditProcessContext(
+                ctx = AuditProcessContext(
                     pid=sc["pid"],
                     comm=sc["comm"],
                     ppid=None,  # Audit doesn't directly provide PPID
+                    parent_comm=None,
                     uid=sc["uid"],
                     username=username,
                     syscall=sc.get("syscall"),
                     exe=sc.get("exe"),
                     timestamp=sc.get("timestamp"),
                 )
+                # Enrich with PPID from /proc since auditd doesn't provide it
+                self._enrich_from_proc(ctx)
+                return ctx
             else:
-                log.debug("Event paths %s don't match target '%s' (comm=%s)", event_paths, target_path, sc.get('comm'))
+                log.debug("Event paths %s don't match target '%s' (comm=%s)", resolved_paths, target_path, sc.get('comm'))
 
         return None
 
@@ -358,6 +401,15 @@ class AuditdResolver:
             return match.group(1)
         # Try unquoted - value is everything up to the next space or end of line
         match = re.search(rf'{field}=(\S+)', line)
+        return match.group(1) if match else None
+
+    def _extract_event_id(self, line: str) -> str | None:
+        """Extract event ID from audit message header.
+
+        Matches: msg=audit(1234567890.123:456) → returns '456'
+        This ID groups all records belonging to the same audit event.
+        """
+        match = re.search(r'msg=audit\([\d.]+:(\d+)\)', line)
         return match.group(1) if match else None
 
     def _extract_timestamp(self, line: str) -> str | None:
@@ -385,6 +437,27 @@ class AuditdResolver:
                 return pwd.getpwnam(uid_str).pw_uid
             except (KeyError, ImportError):
                 return 0
+
+    def _enrich_from_proc(self, ctx: AuditProcessContext) -> None:
+        """Read /proc/[pid]/status to fill in PPID and parent_comm.
+
+        Auditd provides pid, uid, comm, exe, syscall — but not the parent
+        PID or parent process name. Since we already know the PID from the
+        audit event, we can read /proc/[pid]/status to get PPID, then
+        /proc/[ppid]/comm for the parent's short name.
+        """
+        proc_status = Path(f"/proc/{ctx.pid}/status")
+        try:
+            for line in proc_status.read_text().splitlines():
+                if line.startswith("PPid:"):
+                    ctx.ppid = int(line.split()[1])
+                    # Read parent's comm from /proc/[ppid]/comm
+                    parent_comm_path = Path(f"/proc/{ctx.ppid}/comm")
+                    if parent_comm_path.exists():
+                        ctx.parent_comm = parent_comm_path.read_text().strip()
+                    break
+        except (OSError, ValueError, IndexError) as e:
+            log.debug("Could not enrich pid %d from /proc: %s", ctx.pid, e)
 
     def _uid_to_name(self, uid: int | None) -> str | None:
         """Resolve UID to username."""
@@ -425,6 +498,8 @@ if __name__ == "__main__":
         ctx = resolver.find_process_for_file(path)
         if ctx:
             print(f"  PID:      {ctx.pid}")
+            print(f"  PPID:     {ctx.ppid}")
+            print(f"  Parent:   {ctx.parent_comm}")
             print(f"  Comm:     {ctx.comm}")
             print(f"  UID:      {ctx.uid}")
             print(f"  Username: {ctx.username}")
