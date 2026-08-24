@@ -32,6 +32,7 @@ Usage:
 import json
 import logging
 import math
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -61,9 +62,46 @@ KNOWN_PROCESSES = [
     "curl", "wget", "ssh", "grep", "less",
 ]
 
-KNOWN_USERS = ["root", "debian"]
+KNOWN_USERS = ["root", os.getenv("USER", "debian")]
 
 KNOWN_ACCESS_TYPES = ["read", "write", "create", "delete", "moved"]
+
+# Timing-related features for burst/frequency detection
+TIME_DELTA_BUCKETS = {
+    "instant": (0.0, 0.1),      # <100ms (batch attack)
+    "rapid":   (0.1, 1.0),      # 100ms - 1s (fast automation)
+    "normal":  (1.0, 60.0),     # 1s - 1min (typical user)
+    "slow":    (60.0, 600.0),   # 1min - 10min (normal browsing)
+    "idle":    (600.0, float('inf')),  # >10min (idle user)
+}
+TIME_DELTA_NAMES = list(TIME_DELTA_BUCKETS.keys())
+
+def _bucketize_time_delta(delta: float | None) -> str:
+    """Convert time delta (seconds) to a named bucket."""
+    if delta is None:
+        return "normal"  # First event, treat as normal
+    for name, (low, high) in TIME_DELTA_BUCKETS.items():
+        if low <= delta < high:
+            return name
+    return "normal"
+
+SESSION_SIZE_BUCKETS = {
+    "single": (1, 1),          # 1 file (manual access)
+    "small":  (2, 5),          # 2-5 files (small batch)
+    "medium": (6, 20),         # 6-20 files (medium batch)
+    "large":  (21, 50),        # 21-50 files (large batch)
+    "burst":  (51, float('inf')),  # >50 files (attack pattern)
+}
+SESSION_SIZE_NAMES = list(SESSION_SIZE_BUCKETS.keys())
+
+def _bucketize_session_size(count: int | None) -> str:
+    """Convert session file count to a named bucket."""
+    if count is None or count < 1:
+        return "single"
+    for name, (low, high) in SESSION_SIZE_BUCKETS.items():
+        if low <= count <= high:
+            return name
+    return "single"
 
 # Hour buckets: 6 ranges covering 24h
 HOUR_BUCKETS = {
@@ -134,6 +172,10 @@ def extract_event_features(event_row) -> dict:
     if access_type not in KNOWN_ACCESS_TYPES:
         access_type = "read"
 
+    # Timing features for burst detection
+    time_delta = event_row["time_delta"] if "time_delta" in event_row.keys() else None
+    files_in_session = event_row["files_in_session"] if "files_in_session" in event_row.keys() else None
+
     return {
         "artifact": artifact,
         "process": process,
@@ -141,6 +183,8 @@ def extract_event_features(event_row) -> dict:
         "access_type": access_type,
         "hour_bucket": _bucketize_hour(dt),
         "day_bucket": _bucketize_day(dt),
+        "time_delta": _bucketize_time_delta(time_delta),
+        "session_size": _bucketize_session_size(files_in_session),
     }
 
 
@@ -148,11 +192,11 @@ def _categorize_artifact(path: str) -> str:
     """Map a full filesystem path to a short artifact category name.
 
     Examples:
-        /home/debian/.azure/config     → azure
-        /home/debian/.ssh/id_rsa       → ssh
-        /home/debian/.aws/credentials  → aws
-        /home/debian/.kube/config      → kube
-        /etc/shadow                    → etc
+        ~/.azure/config     → azure
+        ~/.ssh/id_rsa       → ssh
+        ~/.aws/credentials  → aws
+        ~/.kube/config      → kube
+        /etc/shadow         → etc
     """
     path_lower = path.lower()
     for keyword in ["azure", "aws", "ssh", "kube", "steampipe", "gnupg",
@@ -178,15 +222,23 @@ NODE_STATES = {
     "access_type": KNOWN_ACCESS_TYPES,
     "hour_bucket": BUCKET_NAMES,
     "day_bucket":  DAY_BUCKET_NAMES,
+    "time_delta":  TIME_DELTA_NAMES,     # NEW: burst detection
+    "session_size": SESSION_SIZE_NAMES,  # NEW: batch size detection
 }
 
 # BN edges — the causal structure
+# Added timing nodes to detect automated/batch attacks
 BN_EDGES = [
+    # Original edges
     ("artifact", "process"),
     ("artifact", "user"),
     ("artifact", "access_type"),
     ("user",     "hour_bucket"),
     ("hour_bucket", "day_bucket"),
+    # NEW: Timing edges for burst/frequency detection
+    ("process", "time_delta"),      # automation tools have fast deltas
+    ("process", "session_size"),    # automation tools process many files
+    ("time_delta", "session_size"), # fast deltas = large sessions
 ]
 
 
@@ -318,16 +370,21 @@ class AnomalyDetector:
         self._trained = False
 
     def train(self, min_events: int = 5) -> dict:
-        """Learn CPDs from all historical events in the database.
+        """Learn CPDs from NORMAL events only (baseline).
+        
+        Attack/anomaly events are excluded from training — they're
+        what we want to DETECT, not learn as normal.
 
         Returns summary dict with training stats.
         """
         from pgmpy.models import DiscreteBayesianNetwork
 
         conn = get_conn()
+        # Only train on normal events (exclude attack sessions)
         rows = conn.execute(
-            "SELECT artifact_path, process_name, username, access_type, timestamp "
-            "FROM events ORDER BY timestamp"
+            "SELECT artifact_path, process_name, username, access_type, timestamp, "
+            "time_delta, files_in_session "
+            "FROM events WHERE session_id NOT LIKE 'attack_%' ORDER BY timestamp"
         ).fetchall()
         conn.close()
 
@@ -382,6 +439,17 @@ class AnomalyDetector:
         for f in features_list:
             day_given_hour[f["hour_bucket"]][f["day_bucket"]] += 1
 
+        # NEW: P(time_delta | process)
+        time_given_process = defaultdict(lambda: defaultdict(int))
+        for f in features_list:
+            time_given_process[f["process"]][f["time_delta"]] += 1
+
+        # NEW: P(session_size | process, time_delta) - multi-parent
+        session_given_both = defaultdict(lambda: defaultdict(int))
+        for f in features_list:
+            key = (f["process"], f["time_delta"])
+            session_given_both[key][f["session_size"]] += 1
+
         # --- Build CPDs ---
         log.info("Building CPDs with Laplace smoothing (alpha=1.0)...")
 
@@ -429,9 +497,29 @@ class AnomalyDetector:
             parent_states=states["hour_bucket"],
         )
 
+        # NEW: CPDs for timing nodes
+        cpd_time_delta = _build_cpd_from_counts(
+            variable="time_delta", parent="process",
+            counts=dict(time_given_process),
+            variable_states=states["time_delta"],
+            parent_states=states["process"],
+        )
+
+        cpd_session_size = _build_cpd_multi_parent(
+            variable="session_size",
+            parents=["process", "time_delta"],
+            counts=dict(session_given_both),
+            variable_states=states["session_size"],
+            parent_states_map={
+                "process": states["process"],
+                "time_delta": states["time_delta"],
+            },
+        )
+
         # Add CPDs to model
         self.model.add_cpds(cpd_artifact, cpd_process, cpd_user,
-                            cpd_access, cpd_hour, cpd_day)
+                            cpd_access, cpd_hour, cpd_day,
+                            cpd_time_delta, cpd_session_size)
 
         # Validate model
         assert self.model.check_model(), "Model validation failed!"
@@ -518,8 +606,31 @@ class AnomalyDetector:
             state_names={"day_bucket": states["day_bucket"], "hour_bucket": states["hour_bucket"]},
         )
 
+        # NEW: CPDs for timing nodes (uniform)
+        n_time = len(states["time_delta"])
+        cpd_time_delta = TabularCPD(
+            variable="time_delta", variable_card=n_time,
+            values=[[1.0 / n_time]] * n_time,
+            evidence=["process"], evidence_card=[n_proc],
+            state_names={"time_delta": states["time_delta"], "process": states["process"]},
+        )
+
+        n_session = len(states["session_size"])
+        cpd_session_size = TabularCPD(
+            variable="session_size", variable_card=n_session,
+            values=[[1.0 / n_session]] * n_session,
+            evidence=["process", "time_delta"],
+            evidence_card=[n_proc, n_time],
+            state_names={
+                "session_size": states["session_size"],
+                "process": states["process"],
+                "time_delta": states["time_delta"],
+            },
+        )
+
         self.model.add_cpds(cpd_artifact, cpd_process, cpd_user,
-                            cpd_access, cpd_hour, cpd_day)
+                            cpd_access, cpd_hour, cpd_day,
+                            cpd_time_delta, cpd_session_size)
         assert self.model.check_model(), "Uniform model validation failed!"
         self._trained = True
         self._save_model()
@@ -609,19 +720,46 @@ class AnomalyDetector:
         factors.append({"variable": "day_bucket", "parent": "hour_bucket",
                         "probability": p, "normal": p > 0.05})
 
-        # --- Normalized scoring using log-probability ratio ---
-        # Each factor contributes log(p_i). Best case = log(1.0) = 0.
-        # Worst case per factor = log(min_p) where min_p is the floor.
+        # NEW: P(time_delta | process)
+        cpd = self.model.get_cpds("time_delta")
+        p = self._lookup_cpd(cpd, "time_delta", features["time_delta"],
+                             {"process": features["process"]})
+        log_score += math.log(max(p, 1e-15))
+        factors.append({"variable": "time_delta", "parent": "process",
+                        "probability": p, "normal": p > 0.05})
+
+        # NEW: P(session_size | process, time_delta)
+        cpd = self.model.get_cpds("session_size")
+        p = self._lookup_cpd(cpd, "session_size", features["session_size"],
+                             {"process": features["process"],
+                              "time_delta": features["time_delta"]})
+        log_score += math.log(max(p, 1e-15))
+        factors.append({"variable": "session_size", "parent": "process+time_delta",
+                        "probability": p, "normal": p > 0.05})
+
+        # --- Weighted scoring: timing anomalies get 2x weight ---
+        # Weight time_delta and session_size factors more heavily
+        weighted_factors = []
+        for f in factors:
+            weight = 2.0 if f["variable"] in ("time_delta", "session_size") else 1.0
+            weighted_factors.append((f["probability"], weight))
+        
+        # Weighted log-score
+        weighted_log_score = sum(
+            weight * math.log(max(p, 1e-15)) for p, weight in weighted_factors
+        )
+        
+        # Normalized scoring using weighted log-probability ratio
         n_factors = len(factors)
         min_p = 1e-3  # floor probability for worst case
-        best_log_score = 0.0                # all factors = 1.0
-        worst_log_score = n_factors * math.log(min_p)  # all factors = min_p
-
-        # Gap from best (0 = perfect match, large = very anomalous)
-        gap = best_log_score - log_score   # always >= 0
+        best_log_score = 0.0
+        worst_log_score = sum(
+            weight * math.log(min_p) for _, weight in weighted_factors
+        )
+        
+        gap = best_log_score - weighted_log_score
         max_gap = best_log_score - worst_log_score
-
-        # Normalize to 0-1: 0 = perfectly normal, 1 = maximally anomalous
+        
         normalized = gap / max_gap if max_gap > 0 else 0.0
         normalized = max(0.0, min(1.0, normalized))
 
@@ -819,7 +957,9 @@ def _print_score(result: dict, verbose: bool = False):
         f"artifact={features.get('artifact', '?')} "
         f"process={features.get('process', '?')} "
         f"user={features.get('user', '?')} "
-        f"hour={features.get('hour_bucket', '?')}"
+        f"hour={features.get('hour_bucket', '?')} "
+        f"delta={features.get('time_delta', '?')} "
+        f"session={features.get('session_size', '?')}"
     )
 
     if verbose:

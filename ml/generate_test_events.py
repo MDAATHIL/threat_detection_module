@@ -5,7 +5,12 @@ Inserts directly into SQLite — does NOT touch any real files.
 """
 
 import random
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
+
+# Ensure we import db.py from the project root, not ml/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from db import get_conn, init_db
 
 # Realistic event templates per artifact category
@@ -93,13 +98,29 @@ HOUR_RANGES = {
     "evening": (18, 23),
 }
 
-# Paths within each artifact category
+# Paths within each artifact category (dynamically resolved from current user's home)
+_HOME = str(Path.home())
 ARTIFACT_PATHS = {
-    "azure": ["/home/debian/.azure/config", "/home/debian/.azure/accessTokens.json", "/home/debian/.azure/azureProfile.json"],
-    "aws":   ["/home/debian/.aws/config", "/home/debian/.aws/credentials", "/home/debian/.aws/cli cache"],
-    "ssh":   ["/home/debian/.ssh/known_hosts", "/home/debian/.ssh/id_rsa", "/home/debian/.ssh/authorized_keys"],
-    "kube":  ["/home/debian/.kube/config"],
-    "steampipe": ["/home/debian/.steampipe/config", "/home/debian/.steampipe/credentials"],
+    "azure": [
+        f"{_HOME}/.azure/config",
+        f"{_HOME}/.azure/accessTokens.json",
+        f"{_HOME}/.azure/azureProfile.json",
+    ],
+    "aws": [
+        f"{_HOME}/.aws/config",
+        f"{_HOME}/.aws/credentials",
+        f"{_HOME}/.aws/cli cache",
+    ],
+    "ssh": [
+        f"{_HOME}/.ssh/known_hosts",
+        f"{_HOME}/.ssh/id_rsa",
+        f"{_HOME}/.ssh/authorized_keys",
+    ],
+    "kube": [f"{_HOME}/.kube/config"],
+    "steampipe": [
+        f"{_HOME}/.steampipe/config",
+        f"{_HOME}/.steampipe/credentials",
+    ],
 }
 
 
@@ -122,8 +143,13 @@ def generate_timestamp(date_str: str, hour_bucket: str) -> str:
     return dt.isoformat()
 
 
-def generate_events(num_per_artifact: int = 40):
-    """Generate test events across all artifacts."""
+def generate_events(num_per_artifact: int = 80, include_attacks: bool = True):
+    """Generate test events across all artifacts.
+    
+    Args:
+        num_per_artifact: Number of normal events per artifact
+        include_attacks: If True, also generates synthetic attack patterns
+    """
     conn = get_conn()
 
     # Generate events over a 14-day window
@@ -147,12 +173,17 @@ def generate_events(num_per_artifact: int = 40):
 
             timestamp = generate_timestamp(date, hour_bucket)
 
+            # Normal user timing: 1-60 seconds between events
+            time_delta = random.uniform(1.0, 60.0)
+            session_id = f"normal_{random.randint(1000, 9999)}"
+            files_in_session = random.randint(1, 5)  # normal users access few files
+
             conn.execute(
                 """INSERT INTO events
                    (timestamp, artifact_path, access_type,
                     pid, process_name, ppid, parent_process_name,
-                    user_id, username)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    user_id, username, time_delta, session_id, files_in_session)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     timestamp,
                     path,
@@ -163,15 +194,82 @@ def generate_events(num_per_artifact: int = 40):
                     "bash" if random.random() > 0.3 else "systemd",
                     1000 if user == "debian" else 0,
                     user,
+                    time_delta,
+                    session_id,
+                    files_in_session,
                 ),
             )
             total += 1
+
+    # Generate synthetic attack patterns for testing burst detection
+    if include_attacks:
+        attack_templates = [
+            {
+                "name": "credential_harvester",
+                "process": "python3",
+                "user": "debian",
+                "artifact": "aws",
+                "num_events": 60,
+            },
+            {
+                "name": "azure_token_stealer",
+                "process": "curl",
+                "user": "root",
+                "artifact": "azure",
+                "num_events": 60,
+            },
+            {
+                "name": "ssh_key_extractor",
+                "process": "cat",
+                "user": "debian",
+                "artifact": "ssh",
+                "num_events": 60,
+            },
+        ]
+
+        for attack in attack_templates:
+            artifact = attack["artifact"]
+            for i in range(attack["num_events"]):
+                # Attack timing: very fast access (instant/rapid buckets)
+                time_delta = random.uniform(0.01, 0.5)  # 10ms to 500ms
+                files_in_session = random.randint(20, 100)  # burst: many files
+                
+                timestamp = (
+                    datetime(2026, 8, 20, 3, 0, 0)
+                    + timedelta(seconds=i * time_delta)
+                ).isoformat()
+                path = random.choice(ARTIFACT_PATHS[artifact])
+                
+                conn.execute(
+                    """INSERT INTO events
+                       (timestamp, artifact_path, access_type,
+                        pid, process_name, ppid, parent_process_name,
+                        user_id, username, time_delta, session_id, files_in_session)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        timestamp,
+                        path,
+                        "read",
+                        random.randint(1000, 65000),
+                        attack["process"],
+                        random.randint(1, 9999),
+                        "python3",
+                        1000 if attack["user"] == "debian" else 0,
+                        attack["user"],
+                        time_delta,
+                        f"attack_{attack['name']}",
+                        files_in_session,
+                    ),
+                )
+                total += 1
 
     conn.commit()
     conn.close()
     print(f"Generated {total} test events across {len(EVENT_TEMPLATES)} artifact categories")
     print(f"Artifacts: {', '.join(EVENT_TEMPLATES.keys())}")
     print(f"Events per artifact: ~{num_per_artifact}")
+    if include_attacks:
+        print(f"Included synthetic attack patterns for burst detection testing")
 
 
 if __name__ == "__main__":

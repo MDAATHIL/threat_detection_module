@@ -17,8 +17,8 @@ Usage:
 
     resolver = AuditdResolver()
     if resolver.is_available():
-        resolver.add_watches(["/home/kali/.aws"])
-        ctx = resolver.find_process_for_file("/home/kali/.aws/credentials")
+        resolver.add_watches(["~/.aws"])
+        ctx = resolver.find_process_for_file("~/.aws/credentials")
     else:
         # Fall back to /proc scanning
         ...
@@ -372,7 +372,7 @@ class AuditdResolver:
                 name = self._extract_quoted(record, "name")
                 if name:
                     # Audit PATH names can be relative ("config") or absolute
-                    # ("/home/debian/.azure/config"). Combine with CWD if relative.
+                    # ("/home/user/.azure/config"). Combine with CWD if relative.
                     if not name.startswith("/") and cwd:
                         name = cwd.rstrip("/") + "/" + name
                     paths.append(name)
@@ -403,7 +403,7 @@ class AuditdResolver:
 
         Handles both quoted and unquoted formats:
           comm="curl"  OR  comm=curl
-          name="/home/kali/.aws/config"  OR  name=/home/kali/.aws/config
+          name="/home/user/.aws/config"  OR  name=/home/user/.aws/config
         """
         # Try quoted first
         match = re.search(rf'{field}="([^"]*)"', line)

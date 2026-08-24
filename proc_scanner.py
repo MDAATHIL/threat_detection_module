@@ -9,9 +9,9 @@ then reads process metadata (name, parent, user) from /proc.
 
 Usage:
     scanner = ProcScanner()
-    context = scanner.scan_for_file("/home/kali/.aws/credentials")
+    context = scanner.scan_for_file("~/.aws/credentials")
     # Returns: {"pid": 1234, "comm": "curl", "ppid": 1000, "parent_comm": "bash",
-    #           "uid": 1000, "username": "kali"}
+    #           "uid": 1000, "username": "debian"}
     # Returns None if no process found (file was opened/closed too fast).
 """
 
@@ -40,7 +40,7 @@ class ProcScanner:
         """Find the first process that has `target_path` open via /proc/*/fd/.
 
         Args:
-            target_path: Absolute path to the file (e.g. /home/kali/.aws/credentials)
+            target_path: Absolute path to the file (e.g. ~/.aws/credentials)
 
         Returns:
             ProcessContext if found, None otherwise.
@@ -67,8 +67,8 @@ class ProcScanner:
                     try:
                         link = os.readlink(fd_entry)
                         # Symlinks look like:
-                        #   /home/kali/.aws/credentials
-                        #   /home/kali/.aws/credentials (deleted)
+                        #   /home/user/.aws/credentials
+                        #   /home/user/.aws/credentials (deleted)
                         #   socket:[12345]
                         if link == target_path or link.startswith(target_path + " ("):
                             return self._read_process_info(pid_dir, pid)
@@ -190,7 +190,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print("Usage: python proc_scanner.py <file_path>")
-        print("Example: python proc_scanner.py /home/kali/.aws/credentials")
+        print("Example: python proc_scanner.py ~/.aws/credentials")
         sys.exit(1)
 
     target = sys.argv[1]

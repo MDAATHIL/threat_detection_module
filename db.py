@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
+import os
 import sqlite3
 from pathlib import Path
 from datetime import datetime
 
 
-DB_PATH = Path(__file__).parent / "collector.db"
+DB_PATH = Path(os.path.dirname(os.path.abspath(__file__))) / "collector.db"
 
 
 def get_conn() -> sqlite3.Connection:
@@ -18,30 +19,53 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create tables if they do not exist."""
+    """Create tables if they do not exist, and add new columns if missing."""
     conn = get_conn()
+    
+    # Check if events table exists
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
+    )
+    table_exists = cursor.fetchone() is not None
+    
+    if not table_exists:
+        # Create fresh table with all columns
+        conn.executescript(
+            """
+            CREATE TABLE events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp       TEXT    NOT NULL,
+                artifact_path   TEXT    NOT NULL,
+                access_type     TEXT    NOT NULL,
+                pid             INTEGER,
+                process_name    TEXT,
+                ppid            INTEGER,
+                parent_process_name TEXT,
+                user_id         INTEGER,
+                username        TEXT,
+                time_delta      REAL,
+                session_id      TEXT,
+                files_in_session INTEGER
+            );
+
+            CREATE INDEX idx_events_artifact
+                ON events(artifact_path);
+            CREATE INDEX idx_events_timestamp
+                ON events(timestamp);
+            CREATE INDEX idx_events_user
+                ON events(user_id);
+            CREATE INDEX idx_events_session
+                ON events(session_id);
+            """
+        )
+        print("✓ Created events table with all columns")
+    else:
+        # Table exists — add missing columns
+        _migrate_db(conn)
+    
+    # Create baseline table if not exists
     conn.executescript(
         """
-        CREATE TABLE IF NOT EXISTS events (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp       TEXT    NOT NULL,   -- ISO-8601 UTC
-            artifact_path   TEXT    NOT NULL,
-            access_type     TEXT    NOT NULL,   -- read, write, create, delete, moved
-            pid             INTEGER,
-            process_name    TEXT,
-            ppid            INTEGER,
-            parent_process_name TEXT,
-            user_id         INTEGER,
-            username        TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_events_artifact
-            ON events(artifact_path);
-        CREATE INDEX IF NOT EXISTS idx_events_timestamp
-            ON events(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_events_user
-            ON events(user_id);
-
         CREATE TABLE IF NOT EXISTS baseline (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             artifact_path       TEXT    NOT NULL,
@@ -50,8 +74,8 @@ def init_db() -> None:
             access_count        INTEGER NOT NULL DEFAULT 0,
             first_seen          TEXT    NOT NULL,
             last_seen           TEXT    NOT NULL,
-            normal_hours        TEXT,           -- JSON array, e.g. "[9,10,11,14,15]"
-            avg_access_interval REAL,           -- seconds between accesses
+            normal_hours        TEXT,
+            avg_access_interval REAL,
             created_at          TEXT    NOT NULL
         );
 
@@ -59,8 +83,32 @@ def init_db() -> None:
             ON baseline(artifact_path, user_id, process_name);
         """
     )
+    
     conn.commit()
     conn.close()
+
+
+def _migrate_db(conn) -> None:
+    """Add new columns to existing tables if they don't exist."""
+    # Get existing columns in events table
+    cursor = conn.execute("PRAGMA table_info(events)")
+    existing_columns = {row["name"] for row in cursor.fetchall()}
+    
+    # Add timing columns if missing
+    migrations = [
+        ("time_delta", "REAL"),
+        ("session_id", "TEXT"),
+        ("files_in_session", "INTEGER"),
+    ]
+    
+    for col_name, col_type in migrations:
+        if col_name not in existing_columns:
+            try:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col_name} {col_type}")
+                print(f"  ✓ Added column: {col_name}")
+            except Exception as e:
+                # Column might already exist or other error
+                pass
 
 
 def insert_event(
@@ -72,6 +120,9 @@ def insert_event(
     parent_process_name: str | None = None,
     user_id: int | None = None,
     username: str | None = None,
+    time_delta: float | None = None,
+    session_id: str | None = None,
+    files_in_session: int | None = None,
 ) -> int:
     """Insert a filesystem access event. Returns the new row id."""
     conn = get_conn()
@@ -80,8 +131,8 @@ def insert_event(
         INSERT INTO events
             (timestamp, artifact_path, access_type,
              pid, process_name, ppid, parent_process_name,
-             user_id, username)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             user_id, username, time_delta, session_id, files_in_session)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.utcnow().isoformat(),
@@ -93,6 +144,9 @@ def insert_event(
             parent_process_name,
             user_id,
             username,
+            time_delta,
+            session_id,
+            files_in_session,
         ),
     )
     row_id = cur.lastrowid
