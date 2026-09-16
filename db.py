@@ -155,6 +155,14 @@ def insert_event(
     return row_id
 
 
+def get_event(event_id: int) -> sqlite3.Row | None:
+    """Fetch a single event row by id (used for real-time scoring)."""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    conn.close()
+    return row
+
+
 def upsert_baseline(
     artifact_path: str,
     user_id: int,

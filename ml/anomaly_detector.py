@@ -25,6 +25,8 @@ Usage:
     python anomaly_detector.py train              # learn from historical events
     python anomaly_detector.py score <event_id>   # score a single event
     python anomaly_detector.py score-all           # score all events
+    python anomaly_detector.py score-all --report  # also write alerts.json report
+    python anomaly_detector.py evaluate            # precision/recall vs labeled attacks
     python anomaly_detector.py explain <event_id>  # detailed explanation
     python anomaly_detector.py status              # show model info
 """
@@ -768,11 +770,13 @@ class AnomalyDetector:
         risk_score = normalized * 100.0
 
         # Risk level classification
-        if risk_score >= 80:
+        # Calibrated on labeled data: normal events max risk ~22.3,
+        # attack events min risk ~27.9 (see `evaluate` command).
+        if risk_score >= 45:
             risk_level = "anomaly"
-        elif risk_score >= 50:
+        elif risk_score >= 27:
             risk_level = "suspicious"
-        elif risk_score >= 20:
+        elif risk_score >= 23:
             risk_level = "unusual"
         else:
             risk_level = "normal"
@@ -1011,6 +1015,12 @@ def main():
             print("No events to score.")
             sys.exit(0)
 
+        # Optional JSON report: score-all --report [path]
+        report_path = None
+        if "--report" in sys.argv[2:]:
+            idx = sys.argv.index("--report")
+            report_path = sys.argv[idx + 1] if len(sys.argv) > idx + 1 and not sys.argv[idx + 1].startswith("--") else "alerts.json"
+
         # Summary stats
         levels = defaultdict(int)
         for r in results:
@@ -1034,6 +1044,77 @@ def main():
                 print()
         else:
             print("No anomalies detected — all events are normal.")
+
+        # Write JSON alert report
+        if report_path:
+            report = {
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "total_events": len(results),
+                "summary": {level: levels.get(level, 0)
+                            for level in ["normal", "unusual", "suspicious", "anomaly"]},
+                "alerts": [
+                    {
+                        "event_id": r["event_id"],
+                        "risk_level": r["risk_level"],
+                        "risk_score": round(r["risk_score"], 2),
+                        "score": round(r["score"], 8),
+                        "features": r.get("features", {}),
+                        "explanation": r.get("explanation", ""),
+                        "factors": r.get("factors", []),
+                    }
+                    for r in sorted(anomalies, key=lambda x: -x["risk_score"])
+                ],
+            }
+            Path(report_path).write_text(json.dumps(report, indent=2))
+            print(f"Report written: {report_path} ({len(report['alerts'])} alerts)")
+
+    elif cmd == "evaluate":
+        # Evaluate detector against labeled data (session_id LIKE 'attack_%')
+        results = detector.score_all_events()
+        if not results:
+            print("No events to evaluate.")
+            sys.exit(0)
+
+        conn = get_conn()
+        id_rows = conn.execute("SELECT id, session_id FROM events").fetchall()
+        conn.close()
+        attack_ids = {r["id"] for r in id_rows if str(r["session_id"] or "").startswith("attack_")}
+
+        flagged_thresholds = ["unusual", "suspicious", "anomaly"]
+        tp = fp = tn = fn = 0
+        for r in results:
+            is_attack = r["event_id"] in attack_ids
+            is_flagged = r["risk_level"] in flagged_thresholds
+            if is_attack and is_flagged:
+                tp += 1
+            elif not is_attack and is_flagged:
+                fp += 1
+            elif not is_attack and not is_flagged:
+                tn += 1
+            else:
+                fn += 1
+
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        accuracy = (tp + tn) / len(results) if results else 0.0
+
+        print(f"\n{'='*70}")
+        print(f"Evaluation — labeled attack data (session_id LIKE 'attack_%')")
+        print(f"{'='*70}")
+        print(f"  Total events:   {len(results)}  (attacks: {len(attack_ids)}, normal: {len(results) - len(attack_ids)})")
+        print(f"  Flag threshold: risk_level >= unusual")
+        print(f"\n  Confusion matrix:")
+        print(f"                       Predicted")
+        print(f"                 Attack     Normal")
+        print(f"  Actual Attack  {tp:>6}    {fn:>6}")
+        print(f"  Actual Normal  {fp:>6}    {tn:>6}")
+        print(f"\n  Metrics:")
+        print(f"    Precision: {precision:.3f}   (of flagged events, how many were real attacks)")
+        print(f"    Recall:    {recall:.3f}   (of real attacks, how many were caught)")
+        print(f"    F1 score:  {f1:.3f}")
+        print(f"    Accuracy:  {accuracy:.3f}")
+        print(f"{'='*70}\n")
 
     elif cmd == "explain":
         if len(sys.argv) < 3:

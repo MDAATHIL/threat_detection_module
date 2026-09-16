@@ -273,5 +273,13 @@ def generate_events(num_per_artifact: int = 80, include_attacks: bool = True):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate labeled synthetic events")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (default 42 — same seed = same dataset)")
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    print(f"Random seed: {args.seed}")
     init_db()
     generate_events()
