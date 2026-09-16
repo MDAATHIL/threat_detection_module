@@ -1,26 +1,18 @@
 version: 1
 monitoring:
-- path: ~/.azure
+- path: /home/kali/.aws
   type: directory
   recursive: true
-  category: cloud_credentials
-
-- path: ~/.aws
+  category: user_defined
+- path: /home/kali/.azure
   type: directory
   recursive: true
-  category: cloud_credentials
-
-- path: ~/.ssh
+  category: user_defined
+- path: /home/kali/.npm
   type: directory
   recursive: true
-  category: authentication
-
-- path: ~/.kube
+  category: user_defined
+- path: /home/kali/.ssh
   type: directory
   recursive: true
-  category: cloud_credentials
-
-- path: ~/.steampipe
-  type: directory
-  recursive: true
-  category: database_credentials
+  category: user_defined

@@ -40,7 +40,16 @@ from pathlib import Path
 
 import numpy as np
 
-import sys
+try:
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score,
+        f1_score, confusion_matrix, classification_report,
+        roc_auc_score, average_precision_score,
+    )
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from db import get_conn, init_db
@@ -537,6 +546,12 @@ class AnomalyDetector:
         }
         log.info("Model trained: %d events → %d nodes, %d edges",
                  len(rows), len(self.model.nodes()), len(self.model.edges()))
+
+        # Evaluate model performance on all events
+        log.info("Evaluating model on all events...")
+        eval_metrics = self._evaluate_model()
+        summary["evaluation"] = eval_metrics
+
         return summary
 
     def _build_uniform_model(self) -> dict:
@@ -635,12 +650,17 @@ class AnomalyDetector:
         self._trained = True
         self._save_model()
 
+        # Evaluate model performance on all events
+        log.info("Evaluating model on all events...")
+        eval_metrics = self._evaluate_model()
+
         return {
             "events_trained": 0,
             "artifacts": states["artifact"],
             "nodes": list(self.model.nodes()),
             "edges": [list(e) for e in self.model.edges()],
             "mode": "uniform_priors",
+            "evaluation": eval_metrics,
         }
 
     # -------------------------------------------------------------------
@@ -807,8 +827,7 @@ class AnomalyDetector:
         """Look up a probability from a CPD given variable value and evidence.
 
         Handles 1D (scalar root), 2D (single-parent), and nD (multi-parent) CPDs.
-        pgmpy internally stores multi-parent CPDs as nD arrays where each
-        dimension corresponds to one parent in evidence order.
+        Uses 2D linear indexing to avoid pgmpy's internal dimension reordering.
         """
         var_states = cpd.state_names[variable]
         var_idx = var_states.index(var_value) if var_value in var_states else 0
@@ -822,16 +841,24 @@ class AnomalyDetector:
                 return float(vals[0]) if len(vals) == 1 else float(vals[var_idx])
             return float(vals[var_idx][0])
 
-        # Build multi-dimensional index for nD arrays
-        # pgmpy orders dimensions as [var, evidence_var_0, evidence_var_1, ...]
-        indices = [var_idx]
-        for ev_var in evidence_vars:
+        # Flatten to 2D and compute linear column index.
+        # pgmpy may reorder evidence variables alphabetically in its nD
+        # representation, so we avoid nD indexing entirely and instead
+        # compute the column index from the 2D [var_card × prod(evidence_cards)]
+        # layout using the evidence order from get_evidence().
+        vals_2d = vals.reshape(vals.shape[0], -1) if vals.ndim > 2 else vals
+
+        col_idx = 0
+        multiplier = 1
+        # Walk evidence in reverse to build column index (last var varies fastest)
+        for ev_var in reversed(evidence_vars):
             ev_states = cpd.state_names[ev_var]
             ev_val = evidence.get(ev_var, ev_states[0])
             ev_idx = ev_states.index(ev_val) if ev_val in ev_states else 0
-            indices.append(ev_idx)
+            col_idx += ev_idx * multiplier
+            multiplier *= len(ev_states)
 
-        return float(vals[tuple(indices)])
+        return float(vals_2d[var_idx, col_idx])
 
     # -------------------------------------------------------------------
     # Batch scoring
@@ -851,6 +878,140 @@ class AnomalyDetector:
             result = self.score_event(row)
             results.append(result)
         return results
+
+    def _evaluate_model(self, risk_threshold: float = 50.0) -> dict:
+        """Evaluate model by scoring all events and computing metrics.
+
+        Ground truth is derived from session_id: events with session_id
+        starting with 'attack_' are labeled as attacks (positive class).
+        Predictions use risk_score >= risk_threshold as anomaly.
+
+        Also finds the optimal threshold that maximizes F1 score and reports
+        metrics at that threshold.
+
+        Returns dict with metrics: accuracy, precision, recall, f1,
+        specificity, auc_roc, auc_pr, confusion matrix, and counts.
+        """
+        results = self.score_all_events()
+        if not results:
+            return {"error": "No events to evaluate"}
+
+        # Get session_ids for ground truth
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT id, session_id FROM events ORDER BY timestamp"
+        ).fetchall()
+        conn.close()
+
+        session_map = {row["id"]: row["session_id"] for row in rows}
+
+        y_true = []   # 1 = attack, 0 = normal
+        y_scores = []  # risk_score (0-100)
+
+        for r in results:
+            eid = r["event_id"]
+            session_id = session_map.get(eid, "")
+            is_attack = 1 if session_id and session_id.startswith("attack_") else 0
+            risk = r["risk_score"]
+
+            y_true.append(is_attack)
+            y_scores.append(risk)
+
+        y_true = np.array(y_true)
+        y_scores = np.array(y_scores)
+
+        total = len(y_true)
+        n_attacks = int(y_true.sum())
+        n_normal = total - n_attacks
+
+        def _compute_metrics_at_threshold(thresh):
+            """Compute metrics for a given risk threshold."""
+            y_pred = (y_scores >= thresh).astype(int)
+            tp = int(((y_pred == 1) & (y_true == 1)).sum())
+            fp = int(((y_pred == 1) & (y_true == 0)).sum())
+            tn = int(((y_pred == 0) & (y_true == 0)).sum())
+            fn = int(((y_pred == 0) & (y_true == 1)).sum())
+            acc = (tp + tn) / total if total > 0 else 0.0
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            f1_ = (2 * prec * rec / (prec + rec)
+                   if (prec + rec) > 0 else 0.0)
+            return {
+                "threshold": round(thresh, 1),
+                "confusion_matrix": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
+                "accuracy": round(acc, 4),
+                "precision": round(prec, 4),
+                "recall": round(rec, 4),
+                "f1_score": round(f1_, 4),
+                "specificity": round(spec, 4),
+            }
+
+        # --- Metrics at requested threshold ---
+        metrics = _compute_metrics_at_threshold(risk_threshold)
+        metrics["total_events"] = total
+        metrics["attack_events"] = n_attacks
+        metrics["normal_events"] = n_normal
+
+        # --- Find optimal threshold by maximizing F1 ---
+        best_f1 = -1.0
+        best_thresh = risk_threshold
+        # Search thresholds from 1 to 99 in 0.5 steps
+        for t in np.arange(1.0, 100.0, 0.5):
+            y_pred_t = (y_scores >= t).astype(int)
+            tp_t = int(((y_pred_t == 1) & (y_true == 1)).sum())
+            fp_t = int(((y_pred_t == 1) & (y_true == 0)).sum())
+            fn_t = int(((y_pred_t == 0) & (y_true == 1)).sum())
+            p_t = tp_t / (tp_t + fp_t) if (tp_t + fp_t) > 0 else 0.0
+            r_t = tp_t / (tp_t + fn_t) if (tp_t + fn_t) > 0 else 0.0
+            f1_t = (2 * p_t * r_t / (p_t + r_t)
+                    if (p_t + r_t) > 0 else 0.0)
+            if f1_t > best_f1:
+                best_f1 = f1_t
+                best_thresh = t
+
+        optimal_metrics = _compute_metrics_at_threshold(best_thresh)
+        metrics["optimal"] = optimal_metrics
+
+        # --- sklearn metrics (at requested threshold) ---
+        y_pred_default = (y_scores >= risk_threshold).astype(int)
+        if HAS_SKLEARN and total > 1:
+            try:
+                metrics["accuracy_sklearn"] = round(
+                    float(accuracy_score(y_true, y_pred_default)), 4)
+                metrics["precision_sklearn"] = round(
+                    float(precision_score(y_true, y_pred_default, zero_division=0)), 4)
+                metrics["recall_sklearn"] = round(
+                    float(recall_score(y_true, y_pred_default, zero_division=0)), 4)
+                metrics["f1_sklearn"] = round(
+                    float(f1_score(y_true, y_pred_default, zero_division=0)), 4)
+                metrics["classification_report"] = classification_report(
+                    y_true, y_pred_default, target_names=["normal", "attack"],
+                    zero_division=0,
+                )
+            except Exception as e:
+                log.debug("sklearn basic metrics failed: %s", e)
+
+            # AUC-ROC (needs both classes present)
+            if len(np.unique(y_true)) > 1:
+                try:
+                    metrics["auc_roc"] = round(
+                        float(roc_auc_score(y_true, y_scores)), 4)
+                except Exception as e:
+                    log.debug("AUC-ROC failed: %s", e)
+                try:
+                    metrics["auc_pr"] = round(
+                        float(average_precision_score(y_true, y_scores)), 4)
+                except Exception as e:
+                    log.debug("AUC-PR failed: %s", e)
+            else:
+                metrics["auc_roc"] = None
+                metrics["auc_pr"] = None
+                metrics["auc_note"] = "Only one class present; AUC undefined"
+        elif not HAS_SKLEARN:
+            metrics["sklearn_note"] = "Install scikit-learn for extended metrics (AUC, report)"
+
+        return metrics
 
     # -------------------------------------------------------------------
     # Model persistence
@@ -990,6 +1151,61 @@ def main():
         print(f"  BN edges:     {len(summary['edges'])}")
         if summary.get("mode") == "uniform_priors":
             print(f"  Mode:         Uniform priors (insufficient data)")
+
+        # Print evaluation metrics
+        eval_m = summary.get("evaluation", {})
+        if eval_m and "error" not in eval_m:
+            # --- Default threshold ---
+            print(f"\n{'='*50}")
+            print(f"Model Evaluation (threshold={eval_m.get('threshold', 50)})")
+            print(f"{'='*50}")
+            print(f"  Total events:  {eval_m['total_events']}")
+            print(f"  Attack events: {eval_m['attack_events']}")
+            print(f"  Normal events: {eval_m['normal_events']}")
+            cm = eval_m.get('confusion_matrix', {})
+            print(f"\n  Confusion Matrix:")
+            print(f"                  Predicted")
+            print(f"                  Normal  Attack")
+            print(f"    Actual Normal  {cm.get('tn',0):>5}  {cm.get('fp',0):>5}")
+            print(f"    Actual Attack  {cm.get('fn',0):>5}  {cm.get('tp',0):>5}")
+            print(f"\n  Metrics:")
+            print(f"    Accuracy:    {eval_m.get('accuracy', 'N/A')}")
+            print(f"    Precision:   {eval_m.get('precision', 'N/A')}")
+            print(f"    Recall:      {eval_m.get('recall', 'N/A')}")
+            print(f"    F1 Score:    {eval_m.get('f1_score', 'N/A')}")
+            print(f"    Specificity: {eval_m.get('specificity', 'N/A')}")
+            if eval_m.get('auc_roc') is not None:
+                print(f"    AUC-ROC:     {eval_m['auc_roc']}")
+            if eval_m.get('auc_pr') is not None:
+                print(f"    AUC-PR:      {eval_m['auc_pr']}")
+            # --- Optimal threshold ---
+            opt = eval_m.get('optimal', {})
+            if opt and opt.get('f1_score', 0) > 0:
+                ocm = opt.get('confusion_matrix', {})
+                print(f"\n{'='*50}")
+                print(f"Optimal Threshold (max F1)")
+                print(f"{'='*50}")
+                print(f"  Threshold:     {opt.get('threshold', 'N/A')}")
+                print(f"\n  Confusion Matrix:")
+                print(f"                  Predicted")
+                print(f"                  Normal  Attack")
+                print(f"    Actual Normal  {ocm.get('tn',0):>5}  {ocm.get('fp',0):>5}")
+                print(f"    Actual Attack  {ocm.get('fn',0):>5}  {ocm.get('tp',0):>5}")
+                print(f"\n  Metrics:")
+                print(f"    Accuracy:    {opt.get('accuracy', 'N/A')}")
+                print(f"    Precision:   {opt.get('precision', 'N/A')}")
+                print(f"    Recall:      {opt.get('recall', 'N/A')}")
+                print(f"    F1 Score:    {opt.get('f1_score', 'N/A')}")
+                print(f"    Specificity: {opt.get('specificity', 'N/A')}")
+            if eval_m.get('classification_report'):
+                print(f"\n  Classification Report (threshold={eval_m.get('threshold', 50)}):")
+                for line in eval_m['classification_report'].splitlines():
+                    print(f"    {line}")
+            if eval_m.get('sklearn_note'):
+                print(f"\n  Note: {eval_m['sklearn_note']}")
+            print(f"{'='*50}")
+        elif eval_m.get('error'):
+            print(f"\n  Evaluation: {eval_m['error']}")
 
     elif cmd == "score":
         if len(sys.argv) < 3:
