@@ -38,7 +38,11 @@ from watchdog.events import (
     DirMovedEvent,
 )
 
-from db import init_db, insert_event
+# ml/ is not a package — load anomaly detector directly from its directory
+sys.path.insert(0, str(Path(__file__).parent / "ml"))
+from anomaly_detector import AnomalyDetector
+
+from db import init_db, insert_event, get_event
 from proc_scanner import ProcScanner
 from auditd_integration import AuditdResolver
 
@@ -83,18 +87,21 @@ class ArtifactHandler(FileSystemEventHandler):
     """Receives inotify events, resolves process context, and logs to SQLite.
     
     Tracks timing patterns to detect burst/frequency-based attacks.
+    Scores each event against the anomaly model in real time.
     """
 
     # Session threshold: events within this many seconds are grouped
     SESSION_TIMEOUT = 5.0  # seconds
     BURST_THRESHOLD = 0.5  # seconds - events faster than this = burst
     
-    def __init__(self, watched_paths: set[str], resolver=None, fallback=None):
+    def __init__(self, watched_paths: set[str], resolver=None, fallback=None,
+                 detector: AnomalyDetector | None = None):
         super().__init__()
         self.watched_paths = watched_paths
         self.resolver = resolver  # AuditdResolver or ProcScanner
         self.fallback = fallback  # ProcScanner as fallback when auditd returns nothing
         self.use_auditd = isinstance(resolver, AuditdResolver)
+        self.detector = detector  # optional real-time scorer
         # Session tracking for burst detection
         self._last_event_time: float = 0.0
         self._session_id: str | None = None
@@ -112,6 +119,31 @@ class ArtifactHandler(FileSystemEventHandler):
             if path.startswith(watched + "/") or path.startswith(watched + os.sep):
                 return watched
         return None
+
+    def _score_event(self, event_id: int) -> None:
+        """Score a freshly-inserted event against the anomaly model and
+        log an inline risk alert if it's anything other than normal."""
+        try:
+            row = get_event(event_id)
+            if row is None:
+                return
+            result = self.detector.score_event(row)
+            level = result["risk_level"]
+            if level == "normal":
+                log.info(
+                    "  risk: NORMAL (score=%.4f)",
+                    result["score"],
+                )
+            else:
+                log.warning(
+                    "  RISK ALERT: %s (risk=%.1f/100) — %s",
+                    level.upper(),
+                    result["risk_score"],
+                    result["explanation"],
+                )
+        except Exception as e:
+            # Scoring must never crash the collector
+            log.debug("Real-time scoring failed for event #%d: %s", event_id, e)
 
     def _update_session(self) -> tuple[float | None, str, int]:
         """Track session for burst detection.
@@ -201,6 +233,10 @@ class ArtifactHandler(FileSystemEventHandler):
             burst_info,
         )
 
+        # Real-time anomaly scoring
+        if self.detector is not None:
+            self._score_event(row_id)
+
 
 def build_watch_list(targets: list[dict]) -> list[tuple[Path, bool]]:
     """Build (path, recursive) pairs from policy targets.
@@ -256,7 +292,17 @@ def start_collector():
         resolver = proc_scanner
         fallback = None
 
-    handler = ArtifactHandler(watched_paths, resolver=resolver, fallback=fallback)
+    # Real-time anomaly scorer (loads trained model if present)
+    detector = AnomalyDetector()
+    if detector.load_model():
+        log.info("Real-time scoring enabled (model: ml/anomaly_model.json)")
+    else:
+        log.warning("No trained model found — real-time scoring disabled "
+                    "(run: python ml/anomaly_detector.py train)")
+        detector = None
+
+    handler = ArtifactHandler(watched_paths, resolver=resolver, fallback=fallback,
+                              detector=detector)
     observer = Observer()
 
     for path, recursive in watch_list:
