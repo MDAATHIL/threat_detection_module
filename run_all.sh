@@ -32,7 +32,20 @@ cd "$(dirname "$0")"
 [[ -x venv/bin/python ]] || fail_exit "venv not found — run: python3 -m venv venv && venv/bin/pip install -r requirements.txt"
 
 # -----------------------------------------------------------------------------
-step "1/6  Environment check"
+step "1/8  Unit test suite"
+# -----------------------------------------------------------------------------
+# `|| true` keeps `set -e` from aborting before we can report which test failed.
+TEST_OUT=$($PY -m unittest discover -s tests -t . 2>&1 || true)
+echo "$TEST_OUT" | grep -E "^(Ran |OK|FAILED)" | sed 's/^/  /'
+if echo "$TEST_OUT" | grep -q "^OK"; then
+    ok "unit tests passed"
+else
+    echo "$TEST_OUT" | tail -30 | sed 's/^/    /'
+    fail_exit "unit tests failed — run: python -m unittest discover -s tests -t ."
+fi
+
+# -----------------------------------------------------------------------------
+step "2/8  Environment check"
 # -----------------------------------------------------------------------------
 $PY -m py_compile db.py collector.py baseline.py proc_scanner.py \
     auditd_integration.py artifact_scan.py \
@@ -46,7 +59,7 @@ $PY -c "import yaml, watchdog, pgmpy" \
 $PY db.py > /dev/null && ok "DB schema initialized" || fail_exit "db.py failed"
 
 # -----------------------------------------------------------------------------
-step "2/6  Fresh seeded dataset (seed $SEED)"
+step "3/8  Fresh seeded dataset (seed $SEED)"
 # -----------------------------------------------------------------------------
 $PY -c "
 from db import get_conn
@@ -57,20 +70,23 @@ $PY ml/generate_test_events.py --seed "$SEED" | tail -3
 COUNTS=$($PY -c "
 from db import get_conn
 c = get_conn()
-total   = c.execute('SELECT COUNT(*) FROM events').fetchone()[0]
-normal  = c.execute(\"SELECT COUNT(*) FROM events WHERE session_id LIKE 'normal_%'\").fetchone()[0]
-attack  = c.execute(\"SELECT COUNT(*) FROM events WHERE session_id LIKE 'attack_%'\").fetchone()[0]
-other   = total - normal - attack
-print(f'{total} {normal} {attack} {other}')
+def n(where):
+    return c.execute(f'SELECT COUNT(*) FROM events WHERE {where}').fetchone()[0]
+total  = n('1=1')
+normal = n(\"session_id LIKE 'normal_%'\")
+burst  = n(\"session_id LIKE 'attack_burst_%'\")
+chain  = n(\"session_id LIKE 'attack_chain_%'\")
+other  = total - normal - burst - chain
+print(f'{total} {normal} {burst} {chain} {other}')
 c.close()
 ")
-read -r TOTAL NORMAL ATTACK OTHER <<< "$COUNTS"
-[[ "$TOTAL" == "580" && "$NORMAL" == "400" && "$ATTACK" == "180" && "$OTHER" == "0" ]] \
-    && ok "dataset: 580 events (400 normal / 180 attack / 0 unlabeled)" \
-    || fail_exit "unexpected dataset: total=$TOTAL normal=$NORMAL attack=$OTHER unlabeled=$OTHER"
+read -r TOTAL NORMAL BURST CHAIN OTHER <<< "$COUNTS"
+[[ "$TOTAL" == "660" && "$NORMAL" == "400" && "$BURST" == "180" && "$CHAIN" == "80" && "$OTHER" == "0" ]] \
+    && ok "dataset: 660 events (400 normal / 180 burst / 80 chain)" \
+    || fail_exit "unexpected dataset: total=$TOTAL normal=$NORMAL burst=$BURST chain=$CHAIN unlabeled=$OTHER"
 
 # -----------------------------------------------------------------------------
-step "3/6  Baseline"
+step "4/8  Baseline"
 # -----------------------------------------------------------------------------
 BASELINE_OUT=$($PY baseline.py 2>&1)
 PROFILES=$(echo "$BASELINE_OUT" | grep -oP 'Profiles built:\s+\K\d+' || echo 0)
@@ -78,7 +94,7 @@ PROFILES=$(echo "$BASELINE_OUT" | grep -oP 'Profiles built:\s+\K\d+' || echo 0)
                         || fail_exit "baseline built 0 profiles"
 
 # -----------------------------------------------------------------------------
-step "4/6  Train + evaluate anomaly model"
+step "5/8  Train + evaluate anomaly model"
 # -----------------------------------------------------------------------------
 TRAIN_OUT=$($PY ml/anomaly_detector.py train 2>&1)
 TRAINED=$(echo "$TRAIN_OUT" | grep -oP 'Events:\s+\K\d+' || echo 0)
@@ -98,7 +114,18 @@ ALERTS=$($PY -c "import json; print(len(json.load(open('alerts.json'))['alerts']
     || fail_exit "flagging mismatch: flagged=$FLAGGED alerts.json=$ALERTS"
 
 # -----------------------------------------------------------------------------
-step "5/6  Live smoke test (collector + real-time scoring)"
+step "6/8  Sequence (chain) layer"
+# -----------------------------------------------------------------------------
+BN_CHAIN=$($PY ml/anomaly_detector.py evaluate 2>/dev/null | grep -oP 'BN alone:\s+\K[0-9]+/[0-9]+' || echo "?")
+SEQ_OUT=$($PY sequences.py --evaluate 2>/dev/null)
+CHAIN_HIT=$(echo "$SEQ_OUT" | grep -oP 'Chain sessions:\s+\K[0-9]+/[0-9]+' || echo "?")
+SEQ_FP=$(echo "$SEQ_OUT" | grep -oP 'Normal sessions:\s+\K[0-9]+' || echo "?")
+[[ "$CHAIN_HIT" == "20/20" && "$SEQ_FP" == "0" ]] \
+    && ok "sequence layer: $CHAIN_HIT chain sessions caught, $SEQ_FP false positives (BN alone: $BN_CHAIN)" \
+    || fail_exit "sequence layer regressed: chain=$CHAIN_HIT fp=$SEQ_FP"
+
+# -----------------------------------------------------------------------------
+step "7/8  Live smoke test (collector + real-time scoring)"
 # -----------------------------------------------------------------------------
 if $SKIP_LIVE; then
     echo "  (skipped — --skip-live)"
@@ -116,12 +143,30 @@ else
         && ok "collector started with real-time scoring" \
         || { kill $COLLECTOR_PID 2>/dev/null; fail_exit "collector did not enable real-time scoring (see /tmp/collector_test.log)"; }
 
-    for i in 1 2 3 4 5; do
+    # (a) Benign single-file access must stay quiet — low-false-positive guard.
+    #     A shell redirect emits a sub-second cluster of events on ONE file,
+    #     which must not read as a credential sweep.
+    echo benign > ~/.azure/.smoke_runall_normal
+    sleep 3
+
+    # (b) A multi-step chain no single event would flag: a private key is
+    #     touched, then authorized_keys is modified — the classic backdoor.
+    #     Only the sequence layer can see this. Run it BEFORE the sweep: every
+    #     event costs an `ausearch` call, and a still-busy handler would make
+    #     the kernel drop these events.
+    touch ~/.azure/id_rsa
+    sleep 3
+    echo attacker >> ~/.azure/authorized_keys
+    sleep 4
+
+    # (c) A credential sweep touches MANY distinct files quickly. The model
+    #     only escalates once the distinct-file count exceeds the normal
+    #     session size (>5), so 12 files is plenty to cross the line.
+    for i in $(seq 1 12); do
         touch ~/.azure/.smoke_runall_$i
-        sleep 0.2
-        rm -f ~/.azure/.smoke_runall_$i
+        sleep 0.15
     done
-    sleep 5
+    sleep 8
     kill -INT $COLLECTOR_PID 2>/dev/null
     # Bounded shutdown: give the collector up to 10s to exit gracefully
     # (SIGINT -> KeyboardInterrupt -> audit rules removed), then force-kill.
@@ -135,11 +180,24 @@ else
     fi
     wait $COLLECTOR_PID 2>/dev/null || true
 
-    EVENTS=$(grep -c "Event #" /tmp/collector_test.log || echo 0)
-    ALERTS_LOG=$(grep -c "RISK ALERT" /tmp/collector_test.log || echo 0)
-    [[ "$EVENTS" -ge 5 && "$ALERTS_LOG" -ge 1 ]] \
+    # `|| true` avoids the "0\n0" trap: grep -c prints 0 AND exits non-zero.
+    EVENTS=$(grep -c "Event #" /tmp/collector_test.log || true)
+    ALERTS_LOG=$(grep -c "RISK ALERT" /tmp/collector_test.log || true)
+    [[ "$EVENTS" -ge 20 && "$ALERTS_LOG" -ge 1 ]] \
         && ok "live test: $EVENTS events captured, $ALERTS_LOG RISK ALERTs (log: /tmp/collector_test.log)" \
         || fail "live test produced $EVENTS events / $ALERTS_LOG alerts — inspect /tmp/collector_test.log"
+
+    # The benign single-file access above must not have raised any alert.
+    BENIGN_ALERTS=$(awk '/Event #/{f = ($0 ~ /smoke_runall_normal/); next} f && /RISK ALERT/{n++} END{print n+0}' /tmp/collector_test.log)
+    [[ "$BENIGN_ALERTS" == "0" ]] \
+        && ok "live test: benign single-file access produced 0 false-positive alerts" \
+        || fail "live test: benign access raised $BENIGN_ALERTS false-positive alert(s)"
+
+    # The multi-step sequence above must raise a chain alert in real time.
+    CHAIN_ALERTS=$(grep -c "CHAIN ALERT" /tmp/collector_test.log || true)
+    [[ "$CHAIN_ALERTS" -ge 1 ]] \
+        && ok "live test: $CHAIN_ALERTS CHAIN ALERT(s) from the multi-step sequence" \
+        || fail "live test: the ssh_key_injection sequence raised no CHAIN ALERT"
 
     # Cleanup: remove smoke-test rows so the labeled dataset stays pristine
     CLEANED=$($PY -c "
@@ -153,13 +211,17 @@ print(f'{n} {total} {attack}')
 c.close()
 ")
     read -r DELETED TOTAL2 ATTACK2 <<< "$CLEANED"
-    [[ "$TOTAL2" == "580" && "$ATTACK2" == "180" ]] \
-        && ok "cleanup: removed $DELETED smoke rows, dataset back to 580/180" \
+
+    # Remove the scratch files the smoke test created on disk
+    rm -f ~/.azure/.smoke_runall_normal ~/.azure/.smoke_runall_* \
+          ~/.azure/id_rsa ~/.azure/authorized_keys
+    [[ "$TOTAL2" == "660" && "$ATTACK2" == "260" ]] \
+        && ok "cleanup: removed $DELETED smoke rows, dataset back to 660/260" \
         || fail_exit "cleanup failed: total=$TOTAL2 attack=$ATTACK2 — wipe and rebuild with ./run_all.sh"
 fi
 
 # -----------------------------------------------------------------------------
-step "6/6  Final state"
+step "8/8  Final state"
 # -----------------------------------------------------------------------------
 $PY ml/anomaly_detector.py evaluate 2>/dev/null | grep -E "Precision|Recall|F1|Accuracy" | sed 's/^/  /'
 
