@@ -203,25 +203,34 @@ class AuditdResolver:
         if not self.is_available():
             return None
 
-        # Audit events may not be in the log yet when inotify fires.
-        # Retry with increasing delays to let auditd flush to disk.
-        for attempt in range(5):
+        # Audit events may not be in the log yet when inotify fires, so retry
+        # briefly. The budget is deliberately tight: this runs on the inotify
+        # handler thread, and blocking for seconds per event lets the kernel's
+        # inotify queue overflow and silently DROP events during a burst —
+        # exactly when we can least afford it.
+        attempts = 3
+        for attempt in range(attempts):
             ctx = self._query_audit(target_path)
             if ctx is not None:
                 return ctx
-            if attempt < 4:
-                time.sleep(0.5)
-        log.debug("No audit event found for %s after 5 attempts", target_path)
+            if attempt < attempts - 1:
+                time.sleep(0.15)
+        log.debug("No audit event found for %s after %d attempts", target_path, attempts)
         return None
 
     def _query_audit(self, target_path: str) -> AuditProcessContext | None:
-        """Single ausearch query for the target path."""
-        # Use --start today to avoid -ts recent missing very new events
+        """Single ausearch query for the target path.
+
+        The window is bounded to the last 10 minutes (`-ts recent`) rather than
+        `-ts today`: this runs once per inotify event, and a whole-day window
+        grows all day, so parsing it per event slows the handler until the
+        kernel drops events. Ten minutes is far more than a retry needs.
+        """
         try:
             result = self._run_audit(
                 [
                     self._ausearch, "-k", self._rule_key,
-                    "-ts", "today",
+                    "-ts", "recent",
                     "-i",
                 ],
             )

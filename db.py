@@ -3,7 +3,7 @@
 import os
 import sqlite3
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 DB_PATH = Path(os.path.dirname(os.path.abspath(__file__))) / "collector.db"
@@ -135,7 +135,7 @@ def insert_event(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             artifact_path,
             access_type,
             pid,
@@ -153,6 +153,14 @@ def insert_event(
     conn.commit()
     conn.close()
     return row_id
+
+
+def get_event(event_id: int) -> sqlite3.Row | None:
+    """Fetch a single event row by id (used for real-time scoring)."""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    conn.close()
+    return row
 
 
 def upsert_baseline(
@@ -192,7 +200,7 @@ def upsert_baseline(
             last_seen,
             normal_hours,
             avg_access_interval,
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
         ),
     )
     conn.commit()

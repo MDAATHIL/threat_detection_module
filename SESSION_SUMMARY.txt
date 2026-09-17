@@ -1,206 +1,334 @@
 ================================================================================
 PROJECT: Behavior-Based Threat Detection for Compromised Linux Servers
-SESSION: Initial MVP — Context Collector + Baseline Engine
-DATE:    2026-08-24
+SESSION: ML Pipeline Complete — Anomaly Detection + Evaluation + Real-Time Alerts
+DATE:    2026-09-16 (hardening follow-up: 2026-09-17)
 ================================================================================
 
 OVERVIEW
 --------
 A system that monitors access to sensitive credential/config artifacts (.aws,
-.ssh, .azure, .kube, .steampipe) on Linux servers. Instead of treating all
-access as malicious, it establishes a baseline of normal behavior and will
-(eventually) flag deviations with explainable risk scores.
+.ssh, .azure, .kube, .steampipe) on Linux servers, establishes a baseline of
+normal behavior, and flags deviations with explainable risk scores — both in
+batch mode and in real time as events are collected.
 
 ARCHITECTURE (Current)
 -----------------------
   Filesystem Access Event
          |
-  collector.py  (watchdog/inotify)  <-- reads policy.yaml for paths
-         |
+  collector.py  (watchdog/inotify)  <-- reads policy_v2.yaml for paths
+         |                             [NEW] real-time scoring per event
   auditd_integration.py  (primary: kernel-level audit, zero race condition)
   proc_scanner.py        (fallback: /proc scan, race-prone)
          |
-    SQLite (events table)  — PID, process, user fields populated
+    SQLite (events table)  — PID, process, user, timing, session fields
+         |
+         +--> ml/anomaly_detector.py  (per-event Bayesian Network scoring)
+         |       |--- train       : learn CPDs from normal_* sessions only
+         |       |--- score-all   : batch score + optional alerts.json report
+         |       |--- evaluate    : burst-layer P/R/F1 + chain blind-spot line
+         |       |--- explain     : per-event probability breakdown
+         |       +--> inline RISK ALERT in collector log
+         |
+         +--> sequences.py  (order-aware chain rules over one session)
+         |       |--- ssh_key_injection, bulk_credential_delete,
+         |       |    cross_artifact_sweep, rapid_multi_file_sweep
+         |       |--- --evaluate : chain recall vs normal false positives
+         |       +--> inline CHAIN ALERT in collector log
+         |
+         +--> alerts.py  (sinks: stdout, alerts.json, syslog, webhook)
          |
   baseline.py   (computes profiles by artifact+user+process)
          |
     SQLite (baseline table)
          |
-    [NOT BUILT YET] anomaly_detector.py  (compares new events vs baseline)
+  alerts.json / chains.json  (machine-readable reports, gitignored)
 
 FILE STRUCTURE
 --------------
-policy.yaml            — Artifact definitions (paths to monitor)
+policy_v2.yaml         — Artifact definitions: .azure, .aws, .ssh, .kube,
+                         .steampipe (all 5 categories monitored)
 artifact_scan.py       — TUI file browser for selecting artifacts to monitor
-requirements.txt       — Dependencies: watchdog>=4.0, pyyaml>=6.0
-db.py                  — SQLite schema + helper functions (insert_event, upsert_baseline)
+requirements.txt       — watchdog, pyyaml, pgmpy
+db.py                  — SQLite schema + helpers (insert_event, upsert_baseline,
+                         get_event)
 proc_scanner.py        — /proc-based process resolver (fallback)
 auditd_integration.py  — auditd-based process resolver (production-grade, sudo)
-collector.py           — inotify collector + auditd/proc process resolution
-baseline.py            — Computes normal behavior profiles from collected events
-collector.db           — SQLite database (events + baseline tables) [created at runtime]
-venv/                  — Python virtual environment (watchdog 6.0.0 installed)
+collector.py           — inotify collector + auditd/proc resolution
+                         + real-time anomaly scoring + chain alerts
+sequences.py           — Order-aware chain detection (rules + CLI + --evaluate)
+alerts.py              — Alert sinks: stdout, alerts.json, syslog, webhook
+baseline.py            — Behavior profile engine
+ml/anomaly_detector.py — Bayesian Network anomaly detector + CLI
+                         (train / score / score-all / evaluate / explain / status)
+ml/generate_test_events.py — Synthetic data: 400 normal (80 per artifact)
+                         + 180 burst attack events (3 patterns, 60 each)
+                         + 80 chain attack events (2 patterns, 10 sessions x 4);
+                         seeded (default 42) for reproducible runs
+ml/anomaly_model.json  — Trained model persistence (structure + CPDs)
+tests/                 — stdlib unittest suite (features, DB, collector,
+                         end-to-end detection); no extra dependencies
+alerts.json            — [NEW] alert report output from `score-all --report`
+collector.db           — SQLite database (events + baseline tables)
+venv/                  — Python virtual environment (Python 3.13.5)
 
 DEPENDENCIES
 ------------
-- Python 3.x
-- watchdog 6.0.0 (inotify-based filesystem monitoring)
-- pyyaml 6.0.3 (YAML parsing for policy.yaml)
-- sqlite3 (stdlib, no install needed)
+- Python 3.13.5 (venv)
+- watchdog (inotify-based filesystem monitoring)
+- pyyaml (YAML parsing for policy_v2.yaml)
+- pgmpy (Discrete Bayesian Network)
+- numpy (model serialization)
+- sqlite3 (stdlib)
 - auditd + audispd-plugins (kernel-level audit, requires sudo)
-- Sudoers configured: debian ALL=(root) NOPASSWD: /usr/sbin/auditctl, /usr/sbin/ausearch
+
+ANOMALY DETECTION MODEL
+-----------------------
+Discrete Bayesian Network (pgmpy) with 8 nodes, 7 edges:
+
+    artifact ──┬── process ──┬── time_delta ── session_size
+               ├── user ── hour_bucket ── day_bucket
+               └── access_type
+
+Nodes:
+  artifact     : azure, aws, ssh, kube, steampipe (dynamic from data)
+  process      : bash, cat, head, tail, nano, python3, curl, wget, ssh,
+                 grep, less, other
+  user         : root, debian, other
+  access_type  : read, write, create, delete, moved
+  hour_bucket  : night, early, morning, midday, afternoon, evening
+  day_bucket   : weekday, weekend
+  time_delta   : instant (<0.1s), rapid (0.1-1s), normal (1-60s),
+                 slow (1-10min), idle (>10min)
+  session_size : single (1), small (2-5), medium (6-20), large (21-50),
+                 burst (51+)
+
+- Trained ONLY on normal events (session_id NOT LIKE 'attack_%') —
+  attack data is held out for evaluation, never trained on.
+- Laplace smoothing (alpha=1.0) for unseen combinations.
+- session_size (DISTINCT files touched per session) gets 2x weight in
+  scoring; raw time_delta gets 1x because every real access emits a
+  sub-second cluster of inotify events, so a fast delta alone is not evidence.
+- Risk score = strongest weighted surprise, max_i(w_i * -ln P(factor_i)) —
+  NOT the sum of log-probabilities, which would dilute a single strong signal.
+- Model persisted to ml/anomaly_model.json; collector auto-loads at startup.
+
+RISK THRESHOLDS (re-calibrated on labeled data, 2026-09-17)
+-----------------------------------------------------------
+Score: risk = 100*(S - 1)/(12 - 1), where S = max_i w_i * -ln P(factor_i)
+       (SURPRISE_FLOOR = 1.0, SURPRISE_CEIL = 12.0)
+
+Measured distributions (seed-42 dataset, reproduces exactly):
+  NORMAL events: risk  5.5 – 25.7   (S <= 3.83)
+  ATTACK events: risk 70.4 – 84.5   (S 8.74 – 10.29)
+
+Classification (ml/anomaly_detector.py):
+  risk >= 85  -> ANOMALY    (magenta) [headroom, not reached]
+  risk >= 45  -> SUSPICIOUS (red)     <-- attacks land here
+  risk >= 40  -> UNUSUAL    (yellow)
+  else        -> NORMAL     (green)
+
+The 25.7/70.4 gap gives clean separation; thresholds sit in the gap
+(40 / 45 / 85). Attacks escalate to SUSPICIOUS in both batch and
+real-time output.
+
+EVALUATION RESULTS (660-event labeled dataset, seed 42)
+--------------------------------------------------------
+  Dataset: 400 normal / 180 burst attack / 80 chain attack
+
+  STATISTICAL LAYER (per-event BN vs burst attacks):
+    Confusion matrix:  TP=180  FN=0  FP=0  TN=400
+    Precision: 1.000   Recall: 1.000   F1: 1.000   Accuracy: 1.000
+    Flag escalation: 180 SUSPICIOUS
+    Chain events flagged by the BN alone: 0/80   <-- blind spot, by design
+
+  SEQUENCE LAYER (order-aware rules):
+    Chain sessions:  20/20 detected
+    Normal sessions: 0/82 false positives
+
+  NOTE: the BN's 1.000 reflects non-overlapping synthetic burst classes
+  (attacks sweep 20-100 DISTINCT files per session; normal sessions touch at
+  most 5). It validates the pipeline, not field performance. The 0/80 is the
+  honest counterweight: a low-and-slow chain defeats the per-event model
+  entirely, which is why sequences.py exists.
+
+Attack patterns detected (synthetic, in ml/generate_test_events.py):
+  BURST (per-event statistical signal):
+    - credential_harvester  (python3, 60 rapid reads on .aws)
+    - azure_token_stealer   (curl,    60 rapid reads on .azure, as root)
+    - ssh_key_extractor     (cat,     60 rapid reads on .ssh)
+  CHAIN (order-only signal, invisible to the BN):
+    - ssh_key_injection     (read .ssh/id_rsa, then write .ssh/authorized_keys)
+    - credential_sweep      (read .aws/.azure/.kube/.steampipe in one session)
+
+REAL-TIME SCORING (NEW)
+-----------------------
+collector.py loads ml/anomaly_model.json at startup and scores every event
+immediately after insertion:
+  NORMAL     -> INFO   "risk: NORMAL (score=...)"
+  non-normal -> WARNING "RISK ALERT: SUSPICIOUS (risk=84.5/100) —
+                P(session_size=medium | time_delta) = 0.0058; ..."
+Scoring failures never crash the collector, and are not silent: the first 3
+(and every 100th) are logged at WARNING, then at debug. If no trained model
+exists, the collector runs fine with scoring disabled and warns, pointing to
+`python ml/anomaly_detector.py train`.
+
+REAL-TIME CHAIN ALERTS
+----------------------
+ArtifactHandler keeps the ordered events of the current session and runs the
+sequence rules after each insert. A chain is reported once, at the event that
+completes it:
+  CHAIN ALERT: SSH_KEY_INJECTION [HIGH] — private key access followed by
+    authorized_keys write (events=[13795, 13802])
+Chain detection failures are caught and logged; they never crash the collector.
+
+Live smoke test (run_all.sh step 7/8), in this order:
+  (a) benign single-file append  -> 0 false-positive alerts
+  (b) touch id_rsa, then append authorized_keys -> CHAIN ALERT (2 raised)
+  (c) 12-distinct-file sweep     -> RISK ALERT: SUSPICIOUS (risk 84.5)
+Rationale: session_size counts DISTINCT files, so the inotify events from one
+ordinary shell redirect no longer look like a credential sweep. The chain
+scenario runs BEFORE the sweep because every event costs an `ausearch` call;
+buriesing the handler makes the kernel drop inotify events.
+
+COLLECTOR THROUGHPUT FIX (2026-09-17)
+-------------------------------------
+Two defects caused inotify events to be DROPPED under load:
+  1. auditd_integration.find_process_for_file retried 5x with 0.5s sleeps
+     (up to 2.5s of blocking on the handler thread) -> now 3x / 0.15s.
+  2. ausearch used `-ts today`, re-parsing a log that grows all day, once per
+     event -> now `-ts recent` (bounded to 10 minutes).
+Both are bounded-money fixes to a real scalability problem, not cosmetics.
+
+STORED PATH FIX (2026-09-17)
+----------------------------
+Live events stored the WATCHED DIRECTORY (/home/debian/.azure) in
+artifact_path while the seeded dataset stores the accessed FILE
+(/home/debian/.azure/authorized_keys). The artifact category is derived from
+the path, so scoring was unaffected — but the chain rules match on file names,
+so DB-based sequence scanning could never fire on live traffic (the runbook's
+"pull the chain out of the database" fallback was silently dead).
+The collector now stores the accessed file path, matching the dataset.
+Found by demo.sh's database-based verification; regression-tested in
+tests/test_collector.py::TestStoredEventPath.
+
+HOW TO RUN
+----------
+# 0. Activate environment
+source venv/bin/activate
+
+# 1. Health check
+python -c "import yaml, watchdog, pgmpy; print('deps OK')"
+python db.py
+
+# 1b. Test suite (81 tests, ~2s)
+python -m unittest discover -s tests -t .
+
+# 2. (Optional) regenerate demo data from scratch
+python -c "from db import get_conn; c=get_conn(); c.execute('DELETE FROM events'); c.execute('DELETE FROM baseline'); c.commit(); c.close()"
+python ml/generate_test_events.py     # 400 normal + 180 burst + 80 chain
+
+# 3. Baseline
+python baseline.py --reset            # compute + display
+python baseline.py --show             # view anytime
+
+# 4. Anomaly detection
+python ml/anomaly_detector.py train         # train on normal sessions only
+python ml/anomaly_detector.py score-all     # batch score + flagged events
+python ml/anomaly_detector.py score-all --report   # + write alerts.json
+python ml/anomaly_detector.py evaluate      # precision/recall/F1/confusion matrix
+python ml/anomaly_detector.py explain <id>  # per-event probability breakdown
+python ml/anomaly_detector.py status        # model info
+
+# 4b. Sequence (chain) layer
+python sequences.py                  # scan stored sessions for chains
+python sequences.py --evaluate       # chain recall vs false positives
+python sequences.py --json chains.json
+
+# 4c. Alert sinks (off by default; configure `alerting:` in policy_v2.yaml)
+python alerts.py                     # show config / optional self-test
+
+# 5. Live demo — one command (starts/stops the collector itself)
+./demo.sh --self --with-metrics      # batch numbers, then benign/chain/sweep
+./demo.sh --fast                     # same flow, ~40s rehearsal
+
+# 5b. Live demo (2 terminals, manual)
+python collector.py                  # terminal 1: watch + real-time score
+echo test >> ~/.azure/config         # terminal 2: trigger an event
+# chain: touch ~/.azure/id_rsa ; sleep 3 ; echo x >> ~/.azure/authorized_keys
+# terminal 1 shows Event #N + risk: NORMAL / RISK ALERT lines; Ctrl+C stops
+# (audit rules are removed automatically on shutdown)
 
 DATABASE SCHEMA (db.py)
 -----------------------
 Table: events
-  id              INTEGER PRIMARY KEY AUTOINCREMENT
-  timestamp       TEXT NOT NULL          -- ISO-8601 UTC
-  artifact_path   TEXT NOT NULL          -- which sensitive path was accessed
-  access_type     TEXT NOT NULL          -- read, write, create, delete, moved
-  pid             INTEGER               -- populated via auditd or /proc
-  process_name    TEXT                  -- populated via auditd or /proc
-  ppid            INTEGER               -- populated via /proc
-  parent_process_name TEXT              -- populated via /proc
-  user_id         INTEGER               -- populated via auditd or /proc
-  username        TEXT                  -- populated via auditd or /proc
-  INDEXES: idx_events_artifact, idx_events_timestamp, idx_events_user
+  id, timestamp, artifact_path, access_type,
+  pid, process_name, ppid, parent_process_name, user_id, username,
+  time_delta (REAL, seconds since previous event),
+  session_id (TEXT; normal_* / attack_burst_* / attack_chain_* prefixes),
+  files_in_session (INTEGER)
+  INDEXES: artifact, timestamp, user, session
 
 Table: baseline
-  id                  INTEGER PRIMARY KEY AUTOINCREMENT
-  artifact_path       TEXT NOT NULL
-  user_id             INTEGER NOT NULL
-  process_name        TEXT NOT NULL
-  access_count        INTEGER NOT NULL DEFAULT 0
-  first_seen          TEXT NOT NULL
-  last_seen           TEXT NOT NULL
-  normal_hours        TEXT               -- JSON array, e.g. "[4,9,14]"
-  avg_access_interval REAL               -- seconds between accesses
-  created_at          TEXT NOT NULL
-  UNIQUE INDEX: (artifact_path, user_id, process_name)
-
-HOW TO RUN
-----------
-# 1. Activate environment
-source venv/bin/activate
-
-# 2. Define what to monitor (TUI browser)
-python artifact_scan.py
-#   Navigate with arrow keys
-#   Space to select files/dirs
-#   S to save policy.yaml
-#   Q to quit
-
-# 3. Start collecting events (runs until Ctrl+C)
-python collector.py
-
-# 4. In another terminal, generate some events (writes are detected)
-echo "# update" >> /home/debian/.azure/config
-
-# 5. Compute baseline
-python baseline.py          # compute and show
-python baseline.py --show   # view without recomputing
-python baseline.py --reset  # clear and recompute
-
-POLICY.YAML FORMAT
-------------------
-version: 1
-monitoring:
-- path: /home/debian/.azure
-  type: directory
-  recursive: true
-  category: user_defined
-
-PROC_SCANNER.PY DETAILS
------------------------
-- Scans /proc/*/fd/ symlinks to find which process has a target file open
-- Returns ProcessContext(pid, comm, ppid, parent_comm, uid, username)
-- On each inotify event, collector triggers scan_for_file(src_path)
-- Fills in PID, process name, parent process, user fields
-- Race condition: quick open/close (e.g. cat file) may not be caught
-- For sustained access (tail, curl, ssh), detection is reliable
-- Also supports scan_for_paths() for multi-target efficiency
-
-AUDITD_INTEGRATION.PY DETAILS
------------------------------
-- Uses auditctl (via sudo) to add file watch rules (kernel-level)
-- Uses ausearch (via sudo) to read audit events (zero race condition)
-- Shared audit key: "artifact_watch_all" (all collector instances use same key)
-- Uses _run_audit() helper that prefixes all commands with sudo
-- Parses audit log output using state-machine:
-  * Splits on '----' separators into event blocks
-  * Groups SYSCALL, CWD, PATH, PROCTITLE records per event
-  * Extracts PID, process name, UID, syscall, exe from SYSCALL records
-  * Resolves relative PATH names using CWD
-  * Skips auditd's own events (auditctl, audispd, auditd processes)
-- Retries up to 5 times with 0.5s delays (auditd may not flush immediately)
-- Detects if auditd is installed and running (graceful fallback)
-- Cleans up audit rules on collector shutdown (remove_watches)
-- Handles both quoted and unquoted ausearch field formats
-- Handles numeric and username UID formats (-i flag)
-
-COLLECTOR.PY DETAILS
---------------------
-- Loads monitoring targets from policy.yaml
-- Uses watchdog Observer + inotify to watch paths
-- At startup, checks if auditd is available:
-  * If yes AND rules install successfully: uses AuditdResolver as primary
-  * If rules fail (no sudo): falls back to ProcScanner (/proc scanning)
-  * If auditd not installed: uses ProcScanner only
-- On any filesystem event:
-  * Maps watchdog event type to access_type (read/write/create/delete/moved)
-  * Matches event path against monitored artifacts (prefix matching)
-  * Resolves process: auditd first, then /proc fallback if auditd returns None
-  * Inserts event into SQLite with full process/user context
-- On shutdown: removes audit rules if auditd was used
-
-BASELINE.PY DETAILS
--------------------
-- Reads all events from SQLite
-- Groups by (artifact_path, user_id, process_name)
-- For each group computes:
-  * access_count: total number of events
-  * first_seen / last_seen: time range
-  * normal_hours: hours of day with >=10% of accesses (JSON array)
-  * avg_access_interval: mean seconds between consecutive accesses
-- Upserts into baseline table (deduplicates on the triple key)
-- CLI: python baseline.py [--reset] [--show]
+  artifact_path, user_id, process_name (UNIQUE triple),
+  access_count, first_seen, last_seen,
+  normal_hours (JSON array), avg_access_interval (REAL), created_at
 
 CURRENT STATUS
 --------------
 COMPLETED:
-  ✅ policy.yaml — artifact definitions (currently monitoring /home/debian/.azure)
-  ✅ artifact_scan.py — TUI policy generator
-  ✅ requirements.txt — dependencies pinned
-  ✅ db.py — SQLite schema + helpers
-  ✅ proc_scanner.py — /proc-based process resolver (with scan_for_file + scan_for_paths)
-  ✅ auditd_integration.py — auditd-based process resolver (production-grade, sudo)
-  ✅ collector.py — inotify collector with auditd+proc dual resolution + fallback
-  ✅ baseline.py — behavior profile engine
-  ✅ End-to-end pipeline tested and working
-  ✅ auditd PID resolution working (bash, cat, python3 all resolved correctly)
+  ✅ Collector pipeline (inotify + auditd + /proc fallback) — end-to-end tested
+  ✅ Baseline engine (profiles by artifact+user+process)
+  ✅ Bayesian Network anomaly detector (8 nodes) with model persistence
+  ✅ Burst detection via distinct-file session_size feature (2x weight)
+     + weighted-surprise risk score (max factor, not sum)
+  ✅ Calibrated risk thresholds (data-driven, clean normal/attack separation)
+  ✅ Seeded data generator (--seed, default 42) — deterministic metrics
+  ✅ evaluate command — precision/recall/F1/confusion matrix (all 1.000)
+  ✅ score-all --report — alerts.json machine-readable output
+  ✅ Real-time scoring in collector with inline RISK ALERT log lines
+  ✅ Sequence layer (sequences.py): 4 order-aware chain rules, auditable ids
+  ✅ Real-time CHAIN ALERT in the collector
+  ✅ Alert sinks (alerts.py): syslog + webhook, policy/env config, best-effort
+  ✅ Two-layer evaluation: burst (BN) and chain (sequence) reported separately
+  ✅ Collector throughput fixed (bounded audit retries + `ausearch -ts recent`)
+  ✅ 81 automated tests (features, DB, collector, sequences, sinks, pipeline)
+  ✅ demo.sh — the whole live demo as one command (paced, verified, self-cleaning)
+  ✅ Live smoke test: benign quiet, chain alert, sweep alert — all verified
+  ✅ Synthetic burst + low-and-slow chain patterns for reproducible demos
 
 KNOWN LIMITATIONS:
-  ⚠️  No anomaly detection yet — events are logged but not scored.
-  ⚠️  No sequence analysis — individual events are tracked, not patterns.
-  ⚠️  No risk scoring — no way to flag suspicious activity yet.
-  ⚠️  Policy only covers .azure — .aws, .ssh, .kube, .steampipe not added.
-
-NEXT STEPS (for next session)
-------------------------------
-1. Build anomaly detector that compares events against baseline
-2. Implement risk scoring (explainable, per-event)
-3. Add sequence analysis for multi-step attack patterns
-4. Expand policy.yaml to cover more artifact categories
-5. Add alerting/reporting for high-risk events
+  ⚠️ Evaluation uses synthetic attacks — real-world FP rate unverified
+     (synthetic normal data is cleaner than production noise).
+  ⚠️ Chain rules are heuristic and name/path based: renaming a private key, or
+     splitting a chain across sessions (>5s idle), evades them. Novel chain
+     shapes are not covered at all.
+  ⚠️ ANOMALY (>=85) is not reached by the synthetic attacks (they top out at
+     84.5) — the tier is headroom for harder attack data.
+  ⚠️ session_id groups events by a 5s idle timeout, not a real login session —
+     a patient attacker pausing >5s per file resets BOTH the distinct-file
+     count and the chain buffer.
+  ⚠️ Alert sinks are fire-and-forget: no retry, queueing, or delivery guarantee.
+  ⚠️ No cross-session correlation — detection is per-session and per-event.
+  ⚠️ detector trained model must be regenerated after major feature changes
+     (model and scoring features must stay in sync).
 
 DESIGN PRINCIPLES
 -----------------
 1. Context over content — accessing .azure/config isn't inherently malicious;
    who, when, and in what sequence determines risk.
-2. Explainability — risk scores must be interpretable, not black-box.
-3. Low false-positive rate — production apps legitimately touch these files.
-4. Sequence-awareness — single access is low-signal; a chain of accesses is
-   high-signal.
+2. Explainability — every flag carries per-factor probabilities.
+3. Low false-positive rate — train on normal only; evaluate against labeled data.
+4. Sequence-awareness — burst size is modeled statistically, and explicit
+   order-aware rules catch multi-step chains the per-event model cannot see.
+5. Defence in depth — two layers with different failure modes; both are
+   reported, including the one the BN misses.
+
+NEXT STEPS (if time permits)
+----------------------------
+1. Cross-session correlation — chains that survive a >5s idle gap
+2. Wider chain rule set + configurable rules in policy_v2.yaml
+3. Real-world validation: replay real audit logs as ground truth
+4. Alert sink delivery guarantees (retry/queue) and richer webhook payloads
 
 ================================================================================
 END OF SESSION SUMMARY

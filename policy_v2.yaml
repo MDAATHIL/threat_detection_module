@@ -24,3 +24,15 @@ monitoring:
   type: directory
   recursive: true
   category: database_credentials
+
+# Optional alert sinks (see alerts.py). Both default to off so a fresh clone
+# never reaches out to the network. Environment overrides:
+#   TDT_SYSLOG_ENABLED=1   TDT_WEBHOOK_URL=https://example.internal/hooks/tdt
+alerting:
+  syslog:
+    enabled: false
+    facility: LOCAL0
+  webhook:
+    enabled: false
+    url: ""
+    timeout: 5
