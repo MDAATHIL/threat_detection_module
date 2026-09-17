@@ -7,22 +7,31 @@ deviations with **explainable risk scores**.
 
 Monitored artifact categories: `~/.azure`, `~/.aws`, `~/.ssh`, `~/.kube`, `~/.steampipe`
 
+> Presenting this? Start with **`DEMO_RUNBOOK.md`** — it has the exact commands
+> to run, in the order that works, plus what to do when a live step fails.
+
 ```
 Filesystem Access Event
         │
-collector.py  (watchdog/inotify, real-time scoring)
+collector.py  (watchdog/inotify + real-time scoring)
         │
 auditd_integration.py   ← primary: kernel-level audit (zero race condition)
 proc_scanner.py         ← fallback: /proc scan (race-prone)
         │
-  SQLite (events)  ──►  inline RISK ALERT in collector log
+  SQLite (events)
+        │
+        ├── ml/anomaly_detector.py   per-event Bayesian Network ─► RISK ALERT
+        └── sequences.py             order-aware chain rules    ─► CHAIN ALERT
+                                │
+                          alerts.py  ─► stdout · alerts.json
+                                     └► syslog · webhook
         │
 baseline.py  (profiles per artifact × user × process)
-        │
-ml/anomaly_detector.py  (Bayesian Network scoring)
-        │
-  alerts.json / console report
 ```
+
+Two detection layers, because they answer different questions: the Bayesian
+Network asks *is this event unusual?*, `sequences.py` asks *do these events,
+in this order, mean something?*
 
 ## How It Works
 
@@ -34,11 +43,19 @@ ml/anomaly_detector.py  (Bayesian Network scoring)
 2. **Baseline** — `baseline.py` groups events by `(artifact, user, process)`
    and computes access counts, active hours, and average intervals.
 3. **Score** — `ml/anomaly_detector.py` trains a discrete Bayesian Network on
-   *normal* sessions only, then computes `P(event)` for every new event.
-   Low probability → high risk. Every factor is reported for explainability.
-4. **Alert** — flagged events surface three ways: inline `RISK ALERT` log
-   lines in the collector, a batch console report, and a machine-readable
-   `alerts.json`.
+   *normal* sessions only, then scores each event by its **strongest weighted
+   surprise**: `S = max_i w_i · −ln P(factor_i)`. A single highly improbable
+   factor is the signal — an attack is a burst of rare values surrounded by
+   ordinary ones, and summing every factor's probability would dilute it.
+   Every factor is reported for explainability.
+4. **Correlate** — `sequences.py` replays the *order* of events inside a
+   session against deliberate chain rules (private key → `authorized_keys`,
+   bulk credential deletion, cross-store sweep, rapid sweep). This catches
+   low-and-slow attacks that leave every individual event looking ordinary,
+   and raises a `CHAIN ALERT` naming the event ids that fired it.
+5. **Alert** — flags surface as inline `RISK ALERT` / `CHAIN ALERT` log
+   lines, a batch console report, `alerts.json`, and — when configured —
+   syslog and a webhook.
 
 ## Setup
 
@@ -63,12 +80,14 @@ source venv/bin/activate
 # One-command rebuild: reset DB, regenerate seeded data, baseline, train,
 # evaluate, generate alerts.json, and run a live smoke test (all verified)
 ./run_all.sh                    # add --skip-live to skip the smoke test
-```
+
+# Unit tests (features, DB, collector, end-to-end detection)
+python -m unittest discover -s tests -t .
 
 # Health check
 python db.py
 
-# Generate a labeled demo dataset (400 normal + 180 attack events)
+# Generate a labeled demo dataset (400 normal + 180 burst + 80 chain events)
 python ml/generate_test_events.py
 
 # Baseline
@@ -83,8 +102,21 @@ python ml/anomaly_detector.py evaluate       # precision/recall/F1/confusion mat
 python ml/anomaly_detector.py explain <id>   # per-event probability breakdown
 python ml/anomaly_detector.py status         # model info
 
+# Sequence (chain) analysis — order-aware, complements the per-event score
+python sequences.py                     # scan stored sessions for chains
+python sequences.py --evaluate          # recall on chains vs false positives
+python sequences.py --json chains.json  # machine-readable chain report
+
+# Alert sinks (off by default; see `alerting:` in policy_v2.yaml)
+python alerts.py                        # show config, optionally self-test
+
 # Live monitoring with real-time scoring
 python collector.py                     # Ctrl+C to stop (removes audit rules)
+
+# Live demo, in one command (see DEMO_RUNBOOK.md §4 for the manual path)
+./demo.sh --self --with-metrics          # batch numbers, then benign/chain/sweep
+./demo.sh                                # same, driving your own collector
+./demo.sh --fast                         # rehearse the whole flow in ~40s
 ```
 
 ### Optional: kernel-level process resolution
@@ -106,7 +138,7 @@ echo test >> ~/.azure/config
 
 ## The Model
 
-A pgmpy `DiscreteBayesianNetwork` — 8 nodes, 8 edges:
+A pgmpy `DiscreteBayesianNetwork` — 8 nodes, 7 edges:
 
 ```
 artifact ──┬── process ──┬── time_delta ── session_size
@@ -130,9 +162,18 @@ Key properties:
 - **Trained on normal only** — events with `session_id LIKE 'attack_%'` are
   excluded from training and held out for evaluation.
 - **Laplace smoothing** (α=1.0) handles unseen feature combinations.
-- **Timing gets 2× weight** — burst patterns (rapid deltas, large sessions)
-  are the highest-signal attack indicator, so `time_delta` and `session_size`
-  factors are double-weighted in the risk score.
+- **Sweep size gets 2× weight** — `session_size` counts *distinct files touched
+  in the session*, which is the credential-sweep signature, so it is
+  double-weighted. Raw `time_delta` keeps 1× because it is noisy: every
+  ordinary file access emits a sub-second cluster of inotify events.
+- **Sessions are counted honestly** — the collector increments
+  `files_in_session` only when a *new* file appears, so `echo x >> file`
+  (several events, one file) is a single-file session, not a burst.
+- **Modelled on the real event stream** — training data reproduces the
+  collector's per-access event clusters, so an ordinary access is not
+  mistaken for an attack. `session_size` is conditioned on `time_delta` alone
+  rather than on `(process, time_delta)`: with ~400 normal events the larger
+  parent set over-parameterises the CPD and Laplace mass hides the signal.
 - **Persisted** to `ml/anomaly_model.json`; the collector auto-loads it at
   startup for real-time scoring.
 
@@ -143,53 +184,99 @@ on the labeled dataset**, not guessed:
 
 | Distribution | Measured range (seed 42) |
 |---|---|
-| Normal events | risk ≤ **20.6** |
-| Attack events | **26.5** – 29.4 |
+| Normal events | risk **5.5** – **25.7** |
+| Attack events | risk **70.4** – **84.5** |
 
 There is a clean gap between the classes — the thresholds sit inside it:
 
 | Risk score | Classification |
 |---|---|
-| ≥ 45 | ANOMALY |
-| ≥ 27 | SUSPICIOUS ← attacks land here |
-| ≥ 23 | UNUSUAL |
-| < 23 | NORMAL |
+| ≥ 85 | ANOMALY |
+| ≥ 45 | SUSPICIOUS ← attacks land here |
+| ≥ 40 | UNUSUAL |
+| < 40 | NORMAL |
+
+The score is `100 · (S − 1) / (12 − 1)` clipped to 0–100, where `S` is the
+weighted surprise above. Normal activity never exceeds `S = 3.83`; the
+synthetic attacks start at `S = 8.74`.
+
+## Sequence (Chain) Analysis
+
+A per-event score cannot see order. An intruder can read a private key and
+then quietly append their own key to `authorized_keys` — every event ordinary,
+the intent visible only in the sequence. `sequences.py` adds a small,
+deliberate rule layer over the ordered events of one session:
+
+| Rule | Fires when | Severity |
+|---|---|---|
+| `ssh_key_injection` | a private key (`id_rsa`, `*.pem`, …) is touched, then `authorized_keys` is written | high |
+| `bulk_credential_delete` | ≥ 3 distinct credential files deleted in one session | high |
+| `cross_artifact_sweep` | ≥ 3 different credential stores touched in one session | high |
+| `rapid_multi_file_sweep` | ≥ 5 distinct files touched within 3 seconds | medium |
+
+Pairs must fall inside a 300-second window and belong to the same session.
+Every alert names the rule, the severity, and the exact event ids, so a chain
+is as auditable as a probability:
+
+```
+CHAIN ALERT: SSH_KEY_INJECTION [HIGH] — private key access followed by
+  authorized_keys write (events=[13795, 13802])
+```
+
+The rule list is deliberately short and explicit: a rule you cannot explain
+is not usable in a SOC.
 
 ## Evaluation Results
 
-Evaluated with `python ml/anomaly_detector.py evaluate` against the labeled
-580-event dataset (400 normal, 180 attack — 3 attack patterns: credential
-harvester on `.aws`, Azure token stealer as root, SSH key extractor):
+The dataset is labeled by session prefix — `normal_*`, `attack_burst_*`
+(three per-event patterns) and `attack_chain_*` (two low-and-slow chains):
 
 ```
-Confusion matrix            Precision: 1.000
-                 Attack  Normal    Recall:    1.000
-Actual Attack     180       0      F1 score:  1.000
-Actual Normal       0     400      Accuracy:  1.000
+$ python ml/anomaly_detector.py evaluate
+  Events: 660  (burst attacks: 180, chain attacks: 80, normal: 400)
+
+  Statistical layer — per-event Bayesian Network vs burst attacks:
+                 Attack     Normal
+  Actual Attack     180         0        Precision: 1.000
+  Actual Normal       0       400        Recall:    1.000
+                                         F1: 1.000  Accuracy: 1.000
+
+  Sequence layer — order-aware rules:
+    Chain events flagged by the BN alone: 0/80   <- the per-event blind spot
+
+$ python sequences.py --evaluate
+  Chain sessions:  20/20 detected
+  Normal sessions: 0/82 false positives
 ```
 
-Every attack event was flagged and no normal event was. Flag escalation with
-the seed-42 dataset: 120 SUSPICIOUS / 60 UNUSUAL.
+Two numbers carry the story. The per-event model separates burst attacks
+cleanly **and is blind to all 80 chain events** — by construction, because
+those chains mimic normal shape. The sequence layer catches **all 20 chain
+sessions with zero false positives** on normal traffic. Neither layer is
+sufficient alone, and reporting both is the point.
 
-> **Why 1.000 — read this before quoting the number.** The evaluation is a
-> *pipeline integration test*, not a field benchmark. The synthetic normal and
-> attack classes are non-overlapping by construction (attacks use 0.01–0.5s
-> deltas and 20–100-file sessions; normals use 1–60s and 1–5 files), so perfect
-> separation is expected. Real attackers can mimic normal timing (deltas of
-> several seconds, small sessions) and would score near-normal — that mimicry
-> gap is exactly what this evaluation cannot measure.
+> **Why the BN's 1.000 — read this before quoting it.** The evaluation is a
+> *pipeline integration test*, not a field benchmark. The synthetic classes
+> are non-overlapping by construction: burst attacks sweep 20–100 **distinct
+> files** per session while normal sessions touch at most 5, and distinct-file
+> count is what the score keys on. The sequence layer is only as good as its
+> rules — a chain shape the four rules do not describe is still missed. No
+> real-world validation has been done.
 
 ### Reproducibility
 
 The generator is seeded: `python ml/generate_test_events.py --seed 42`
-(defaults to 42). The same seed always produces the same 580 events, the same
-baseline (112 profiles), and the same metrics above. Regenerating without the
+(defaults to 42). The same seed always produces the same 660 events, the same
+baseline (118 profiles), and the same metrics above. Regenerating without the
 same seed yields different draws — profile counts and the risk band shift
 slightly, though detection performance is unaffected.
 
 ## Project Layout
 
 ```
+DEMO_RUNBOOK.md         Step-by-step presentation flow, commands, fallbacks
+PRESENTATION.md         5-minute talk script + anticipated Q&A
+demo.sh                 The live demo (benign/chain/sweep) as one command
 policy_v2.yaml          Monitoring targets (5 credential categories)
 artifact_scan.py        TUI browser for building the policy
 collector.py            inotify collector + real-time scoring
@@ -199,7 +286,10 @@ db.py                   SQLite schema + helpers
 baseline.py             Behavior profile engine
 ml/anomaly_detector.py  Bayesian Network detector + CLI
 ml/generate_test_events.py  Labeled synthetic data generator
+sequences.py            Order-aware chain rules + CLI
 ml/anomaly_model.json   Trained model (auto-generated)
+alerts.py               Optional syslog / webhook alert sinks
+tests/                  Unit + end-to-end tests (81, stdlib unittest, no new deps)
 alerts.json             Alert report (auto-generated, gitignored)
 collector.db            SQLite database (auto-created)
 ```
@@ -217,11 +307,16 @@ collector.db            SQLite database (auto-created)
 
 ## Known Limitations
 
-- Perfect evaluation metrics reflect non-overlapping synthetic classes, not
-  field performance; realistic attacks (slower deltas, small sessions) are
-  the known blind spot, and no real-world validation has been done yet.
-- No sequence analysis yet — events are scored individually, not as attack
-  chains (e.g. `cat id_rsa` → append `authorized_keys`).
-- Alert sinks are stdout + `alerts.json`; no syslog/email/webhook yet.
-- Attack risk scores cluster narrowly (27.9–30.9), so ANOMALY (≥45) is
-  rarely reached — the threshold awaits more diverse attack data.
+- Perfect statistical metrics reflect non-overlapping synthetic classes, not
+  field performance, and no real-world validation has been done yet.
+- Chain rules are heuristic and name/path based. An attacker who renames a
+  private key, or splits a chain across sessions (pausing >5s per step),
+  evades them; novel chain shapes are not covered at all.
+- ANOMALY (≥85) is not reached by the synthetic burst attacks (they top out
+  at 84.5) — the tier is headroom for harder, more blatant attack data.
+- `session_id` groups events by a 5-second idle timeout, not by a real login
+  session, so a patient attacker who pauses >5s per file resets both the
+  distinct-file count and the chain buffer.
+- Alert sinks are fire-and-forget: no retry, queueing, or delivery guarantee.
+- Detection is per-session and per-event; there is no cross-session or
+  long-horizon correlation.

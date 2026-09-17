@@ -40,8 +40,10 @@ from watchdog.events import (
 
 # ml/ is not a package — load anomaly detector directly from its directory
 sys.path.insert(0, str(Path(__file__).parent / "ml"))
-from anomaly_detector import AnomalyDetector
+from anomaly_detector import AnomalyDetector, _categorize_artifact
+from sequences import EventView, detect_chains
 
+import alerts
 from db import init_db, insert_event, get_event
 from proc_scanner import ProcScanner
 from auditd_integration import AuditdResolver
@@ -102,11 +104,15 @@ class ArtifactHandler(FileSystemEventHandler):
         self.fallback = fallback  # ProcScanner as fallback when auditd returns nothing
         self.use_auditd = isinstance(resolver, AuditdResolver)
         self.detector = detector  # optional real-time scorer
+        self._score_errors = 0    # consecutive scoring failures (for logging)
         # Session tracking for burst detection
         self._last_event_time: float = 0.0
         self._session_id: str | None = None
-        self._session_file_count: int = 0
+        self._session_files: set[str] = set()
         self._session_start_time: float = 0.0
+        # Ordered events in the current session, for sequence (chain) analysis
+        self._session_events: list[EventView] = []
+        self._chained_rules: set[str] = set()
 
     def _matches_artifact(self, path: str) -> str | None:
         """Check if an event path falls under a monitored artifact.
@@ -141,38 +147,63 @@ class ArtifactHandler(FileSystemEventHandler):
                     result["risk_score"],
                     result["explanation"],
                 )
+                alerts.emit({
+                    "type": "risk",
+                    "risk_level": level,
+                    "risk_score": round(result["risk_score"], 2),
+                    "event_id": event_id,
+                    "explanation": result["explanation"],
+                    "features": result.get("features", {}),
+                })
         except Exception as e:
-            # Scoring must never crash the collector
-            log.debug("Real-time scoring failed for event #%d: %s", event_id, e)
+            # Scoring must never crash the collector, but it must not fail
+            # silently either: a broken model would otherwise switch detection
+            # off with nothing in the log to show for it.
+            self._score_errors += 1
+            if self._score_errors <= 3 or self._score_errors % 100 == 0:
+                log.warning(
+                    "Real-time scoring failed for event #%d "
+                    "(%d failure(s) so far): %s",
+                    event_id, self._score_errors, e,
+                )
+            else:
+                log.debug("Real-time scoring failed for event #%d: %s", event_id, e)
 
-    def _update_session(self) -> tuple[float | None, str, int]:
-        """Track session for burst detection.
-        
+    def _update_session(self, path: str) -> tuple[float | None, str, int]:
+        """Track the current access session for burst detection.
+
+        A session is a run of events separated by less than SESSION_TIMEOUT.
+        `files_in_session` counts DISTINCT files touched — that is the
+        credential-sweep signal. Repeated events on one file must not inflate
+        it, since a single normal shell redirect emits several inotify events.
+
         Returns:
             (time_delta, session_id, files_in_session)
         """
         now = time.time()
         time_delta = None
-        
+
         if self._last_event_time > 0:
             time_delta = now - self._last_event_time
-            
+
             # Start new session if too much time has passed
             if time_delta > self.SESSION_TIMEOUT:
                 self._session_id = str(uuid.uuid4())[:8]
-                self._session_file_count = 1
+                self._session_files = set()
+                self._session_events = []
+                self._chained_rules = set()
                 self._session_start_time = now
-            else:
-                # Continue existing session
-                self._session_file_count += 1
         else:
             # First event ever
             self._session_id = str(uuid.uuid4())[:8]
-            self._session_file_count = 1
+            self._session_files = set()
+            self._session_events = []
+            self._chained_rules = set()
             self._session_start_time = now
-        
+
+        self._session_files.add(path)
         self._last_event_time = now
-        return time_delta, self._session_id, self._session_file_count
+        return time_delta, self._session_id, len(self._session_files)
 
     def on_any_event(self, event):
         """Called for every inotify event."""
@@ -204,10 +235,14 @@ class ArtifactHandler(FileSystemEventHandler):
             ctx = self.resolver.scan_for_file(src)
 
         # Track timing for burst detection
-        time_delta, session_id, files_in_session = self._update_session()
+        time_delta, session_id, files_in_session = self._update_session(src)
 
+        # Store the accessed FILE, not the watched directory. The dataset uses
+        # full file paths, the artifact category is derived from the path, and
+        # the chain rules match on file names (id_rsa, authorized_keys) — so
+        # storing the directory made live events unusable for sequence analysis.
         row_id = insert_event(
-            artifact_path=artifact,
+            artifact_path=src or artifact,
             access_type=access_type,
             pid=ctx.pid if ctx else None,
             process_name=ctx.comm if ctx else None,
@@ -236,6 +271,54 @@ class ArtifactHandler(FileSystemEventHandler):
         # Real-time anomaly scoring
         if self.detector is not None:
             self._score_event(row_id)
+
+        # Order-aware sequence analysis (complements the per-event score)
+        self._check_chains(row_id, src, access_type, ctx, artifact)
+
+    def _check_chains(self, row_id: int, path: str, access_type: str,
+                      ctx, artifact: str) -> None:
+        """Run chain rules over the session so far and alert on new matches.
+
+        A chain is reported once, at the event that completes it, so a long
+        session does not emit the same alert repeatedly.
+        """
+        self._session_events.append(EventView(
+            id=row_id,
+            path=path,
+            access_type=access_type,
+            process=(ctx.comm if ctx else "unknown").lower(),
+            artifact=artifact,
+            t=time.time(),
+        ))
+
+        try:
+            matches = detect_chains(self._session_events)
+        except Exception as e:
+            # Sequence analysis must not be able to crash the collector.
+            log.warning("Chain detection failed for event #%d: %s", row_id, e)
+            return
+
+        for match in matches:
+            if not match.event_ids or match.event_ids[-1] != row_id:
+                continue  # this chain did not complete on the current event
+            if match.rule in self._chained_rules:
+                continue  # already reported for this session
+            self._chained_rules.add(match.rule)
+
+            log.warning(
+                "  CHAIN ALERT: %s [%s] — %s (events=%s)",
+                match.rule.upper(), match.severity.upper(),
+                match.description, match.event_ids,
+            )
+            alerts.emit({
+                "type": "chain",
+                "rule": match.rule,
+                "severity": match.severity,
+                "description": match.description,
+                "detail": match.detail,
+                "session_id": self._session_id,
+                "event_ids": match.event_ids,
+            })
 
 
 def build_watch_list(targets: list[dict]) -> list[tuple[Path, bool]]:
@@ -300,6 +383,16 @@ def start_collector():
         log.warning("No trained model found — real-time scoring disabled "
                     "(run: python ml/anomaly_detector.py train)")
         detector = None
+
+    # Which alert sinks are configured (stdout is always on)
+    alert_config = alerts.load_alert_config()
+    enabled_sinks = [name for name in ("syslog", "webhook")
+                     if alert_config.get(name, {}).get("enabled")]
+    if enabled_sinks:
+        log.info("Alert sinks enabled: %s", ", ".join(enabled_sinks))
+    else:
+        log.info("Alert sinks: stdout only (configure `alerting:` in "
+                 "policy_v2.yaml for syslog/webhook)")
 
     handler = ArtifactHandler(watched_paths, resolver=resolver, fallback=fallback,
                               detector=detector)

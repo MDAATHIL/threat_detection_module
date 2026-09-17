@@ -23,6 +23,10 @@ Confirm the final block shows all four metrics at 1.000. That's your state.
 If this passes, the live demo will work — it just ran the same code path.
 Keep `/tmp/collector_test.log` around as your screenshot fallback.
 
+> Optional shortcut for §4 below: `./demo.sh --self` fires the three live
+> scenarios with the correct pacing and cleans up after itself, so you can
+> narrate instead of typing. `--fast` rehearses it in ~40 seconds.
+
 ---
 
 ## Flow (5 minutes)
@@ -43,17 +47,23 @@ Draw or show:
 
 ```
 filesystem event → collector (inotify) → auditd resolves pid/user (kernel-level)
-                 → SQLite → baseline profiles → Bayesian Network → risk score
+                 → SQLite ─┬─ Bayesian Network  ─► RISK ALERT  (per event)
+                           │
+                           └─ sequence rules   ─► CHAIN ALERT (per session)
 ```
 
 Talking points:
 - **auditd, not polling** — kernel-level audit trail, zero race condition,
   with a `/proc` fallback if auditd isn't available (graceful degradation).
+- **Two layers, two questions** — the Bayesian Network asks *is this event
+  unusual?*; `sequences.py` asks *do these events, in this order, mean
+  something?* A per-event score structurally cannot see a chain.
 - **Bayesian Network, 8 nodes** — artifact, process, user, access type, hour,
-  weekday, time-delta, session size. Timing features get **2× weight** because
-  burst access is the strongest attack signal.
+  weekday, time-delta, session size. `session_size` (distinct files touched)
+  gets **2× weight** because a credential sweep is the strongest signal.
 - **Explainable by design** — every score decomposes into per-factor
-  probabilities. Not a black box.
+  probabilities, and every chain names the exact event ids that fired it.
+  Not a black box.
 
 ### 3. Metrics (30s)
 
@@ -63,12 +73,22 @@ python ml/anomaly_detector.py evaluate
 
 Show: confusion matrix TP=180 FN=0 FP=0 TN=400, all metrics 1.000.
 
-**Then immediately pre-empt the question (see Q&A #1):**
+```bash
+python sequences.py --evaluate
+```
 
-> "To be clear about what this 1.000 means — the synthetic attack and normal
-> classes are separable by construction. This validates the pipeline
-> end-to-end on a fixed seed. The real-world blind spot is timing mimicry,
-> which is documented as future work."
+Show: `Chain sessions: 20/20 detected`, `Normal sessions: 0/82 false positives`.
+
+**Then immediately pre-empt the question (see Q&A #1) — and make the second
+number the point:**
+
+> "To be clear about what this 1.000 means — the synthetic burst classes are
+> separable by construction: attacks sweep 20–100 distinct files per session,
+> normals touch at most 5. This validates the pipeline end-to-end on a fixed
+> seed. And the same run tells you where the per-event model *fails*: it flags
+> **0 of the 80 low-and-slow chain events**. That's the honest blind spot, and
+> it's exactly why there's a second layer — which catches all 20 chain
+> sessions with no false positives on normal traffic."
 
 Saying it first reads as rigor. Being asked first reads as a hole.
 
@@ -80,26 +100,49 @@ python collector.py
 ```
 Wait for: `Real-time scoring enabled` and `Collector started`.
 
-Terminal 2 — the attack (rapid credential sweep):
-```bash
-for i in 1 2 3; do touch ~/.azure/.sneaky_$i; sleep 0.2; rm -f ~/.azure/.sneaky_$i; done
-```
+Run the three scenarios **in this order** — the chain first, the sweep last.
+Every event costs an `ausearch` call, so doing the heavy sweep last keeps the
+handler from falling behind (and the demo from dropping events).
 
-Terminal 1 shows, within a second:
-```
-Event #N: create on /home/debian/.azure/.sneaky_1 (pid=6383 comm=touch user=debian ...)
-  RISK ALERT: SUSPICIOUS (risk=30.7/100) — P(time_delta=rapid | process) = 0.0119; ...
-```
-
-Narrate: *"It resolved the exact process and user from the kernel audit trail,
-scored the event in real time, and flagged the rapid timing as the anomaly
-driver — that last part is the explainability."*
-
-Then show a normal access:
+**(a) Normal access stays quiet**
 ```bash
 echo test >> ~/.azure/config
 ```
-→ logs `risk: NORMAL`. *"Low false positives matter as much as catching attacks."*
+→ **all four** events log `risk: NORMAL`. *"Low false positives matter as much
+as catching attacks. That redirect is a cluster of inotify events on a single
+file, and the model knows a one-file session is normal."*
+
+**(b) The chain — the part a per-event model cannot see**
+```bash
+touch ~/.azure/id_rsa
+sleep 3
+echo attacker >> ~/.azure/authorized_keys
+```
+Terminal 1:
+```
+CHAIN ALERT: SSH_KEY_INJECTION [HIGH] — private key access followed by
+  authorized_keys write (events=[13795, 13802])
+```
+Narrate: *"Two files, three seconds apart, nothing statistically unusual — the
+Bayesian Network scores both events as normal. The chain is what matters:
+private key touched, then `authorized_keys` written. That's the classic
+backdoor, and the rule names the exact event ids that fired it."*
+
+**(c) The credential sweep — the statistical layer**
+```bash
+for i in $(seq 1 30); do touch ~/.azure/.sneaky_$i; sleep 0.15; done
+```
+The sweep has to be broad, not just fast: the model escalates once the session
+touches more than 5 distinct files. A 3-file burst is genuinely
+indistinguishable from normal activity — and should stay quiet.
+Terminal 1:
+```
+RISK ALERT: SUSPICIOUS (risk=84.5/100) — P(session_size=medium | time_delta) = 0.0058; ...
+```
+Narrate: *"It resolved the exact process and user from the kernel audit trail,
+scored the event in real time, and flagged the session size — the number of
+distinct credential files touched — as the anomaly driver. That's the
+explainability."*
 
 **If the demo gods are angry:** fall back to `cat /tmp/collector_test.log`
 and narrate from the morning's verified run. Never debug live.
@@ -117,24 +160,26 @@ which condition fired, not just a score."*
 ### 6. Close (30s)
 
 - **Done:** collector with kernel-level attribution, baseline engine,
-  explainable Bayesian scoring, real-time alerting, JSON reports,
-  seeded reproducible evaluation.
-- **Next (say it before they ask):** sequence analysis for multi-step attack
-  chains (`cat id_rsa` → append `authorized_keys`), real-world validation
-  against audit-log ground truth, alert sinks (syslog/webhook).
+  explainable Bayesian scoring, an order-aware sequence layer for multi-step
+  chains, real-time RISK + CHAIN alerts, syslog/webhook sinks, JSON reports,
+  an 81-test suite, and seeded reproducible evaluation.
+- **Next (say it before they ask):** real-world validation against audit-log
+  ground truth, cross-session correlation (chains that span more than one
+  session survive an idle gap today), and widening the chain rule set.
 
 ---
 
 ## Anticipated Q&A
 
 **Q1: "Your precision is 1.000 — isn't that suspicious?"**
-> "Right — it means the evaluation classes are separable by construction, not
-> that field performance is perfect. The attack generator uses 10–500ms deltas
-> and 20–100-file sessions; normal data uses 1–60s and 1–5 files. There's no
-> overlap, so perfect separation is expected. The metric validates the
-> pipeline on a fixed seed. A real attacker mimicking normal timing is the
-> documented blind spot — that's the first thing I'd attack this system with,
-> and it needs sequence analysis and real-world data to close."
+> "Right — it means the synthetic burst classes are separable by construction,
+> not that field performance is perfect. Attacks sweep 20–100 distinct files
+> per session; normal sessions touch at most 5, and distinct-file count is
+> exactly what the score keys on. The metric validates the pipeline on a fixed
+> seed. The genuinely interesting number is right underneath it: the per-event
+> model flags **0 of the 80 chain events**. An adversary who mimics normal
+> shape defeats it by design. That's why there's a sequence layer, and it's
+> why I report both numbers instead of the flattering one."
 
 **Q2: "Why a Bayesian Network and not an ML classifier / autoencoder?"**
 > "Explainability is a requirement, not a preference — a SOC needs to know
@@ -143,10 +188,11 @@ which condition fired, not just a score."*
 > abundant normal behavior and no realistic labeled attacks in production."
 
 **Q3: "Why SUSPICIOUS and never ANOMALY?"**
-> "Thresholds are calibrated to measured score distributions — normal events
-> max out at 20.6, attacks start at 26.5, and the cutoffs sit in that gap.
-> The ANOMALY tier (≥45) is a placeholder for harder, more subtle attack
-> data. A flag level I can defend beats a dramatic label I can't."
+> "Thresholds are calibrated to measured score distributions, not guessed:
+> normal events top out at 25.7, attacks start at 70.4 and reach 84.5, and the
+> cutoffs sit inside that gap. ANOMALY (≥85) is deliberate headroom for
+> harder, more blatant attack data. A flag level I can defend beats a dramatic
+> label I can't."
 
 **Q4: "What's the false-positive story in production?"**
 > "The design targets it three ways: training on normal-only, per-factor
@@ -163,8 +209,17 @@ which condition fired, not just a score."*
 **Q6: "How is this different from just watching file access with auditd?"**
 > "auditd gives you events; it doesn't tell you what's abnormal. The added
 > layers are the behavioral model (who/when/speed baselines), real-time risk
-> scoring with explanation, and session-level burst detection — the difference
-> between logging and detecting."
+> scoring with explanation, session-level burst detection, and order-aware
+> chain rules — the difference between logging and detecting."
+
+**Q7: "Is the sequence layer just a pile of regex rules?"**
+> "Yes — four explicit rules, and that's deliberate. A rule I can state is a
+> rule a SOC can tune, argue with, and audit; each alert names the exact event
+> ids that fired it. It also has a clear failure mode I can state honestly:
+> rename the private key, or pause more than five seconds between steps and
+> let the session split, and the rule won't fire. The per-event model has the
+> complementary weakness — it can't see order at all. Together they cover
+> more than either does alone, and I can say precisely where each one breaks."
 
 ---
 
@@ -172,10 +227,13 @@ which condition fired, not just a score."*
 
 | Command | What it shows |
 |---|---|
-| `./run_all.sh` | Full rebuild + verification (6 stages, all green) |
-| `python ml/anomaly_detector.py evaluate` | Confusion matrix + P/R/F1 |
-| `python collector.py` | Live monitoring + real-time alerts |
+| `./demo.sh --self --with-metrics` | The whole live demo (benign → chain → sweep) as one command |
+| `./run_all.sh` | Full rebuild + verification (8 stages, all green) |
+| `python ml/anomaly_detector.py evaluate` | Confusion matrix + P/R/F1 + the BN's chain blind spot |
+| `python sequences.py --evaluate` | Chain recall vs false positives |
+| `python collector.py` | Live monitoring + real-time RISK and CHAIN alerts |
 | `echo test >> ~/.azure/config` | Normal event → `risk: NORMAL` |
-| `touch ~/.azure/.sneaky_1` | Burst → `RISK ALERT: SUSPICIOUS` |
+| `touch ~/.azure/id_rsa` then `echo x >> ~/.azure/authorized_keys` | Chain → `CHAIN ALERT: SSH_KEY_INJECTION` |
+| `for i in $(seq 1 30); do touch ~/.azure/.sneaky_$i; sleep 0.15; done` | Sweep → `RISK ALERT: SUSPICIOUS` |
 | `python ml/anomaly_detector.py explain <id>` | Per-factor probability breakdown |
 | `cat alerts.json | head` | Machine-readable SOC-ready output |
