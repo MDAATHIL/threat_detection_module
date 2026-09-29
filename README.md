@@ -117,6 +117,9 @@ python collector.py                     # Ctrl+C to stop (removes audit rules)
 ./demo.sh --self --with-metrics          # batch numbers, then benign/chain/sweep
 ./demo.sh                                # same, driving your own collector
 ./demo.sh --fast                         # rehearse the whole flow in ~40s
+
+# Interactive web dashboard — every operation above, in a browser
+python dashboard.py --open
 ```
 
 ### Optional: kernel-level process resolution
@@ -135,6 +138,68 @@ Trigger a test event while the collector runs:
 ```bash
 echo test >> ~/.azure/config
 ```
+
+## Web Dashboard
+
+The dashboard is a thin control surface over the code above — every button
+calls the same function the CLI calls and reads the same `collector.db`.
+There is no mock data and no second copy of the detection logic.
+
+```bash
+python dashboard.py                 # http://127.0.0.1:8765
+python dashboard.py --open          # also launch a browser
+python dashboard.py --port 9000     # different port
+```
+
+It uses only the standard library for the web layer (no Flask/Django), so
+nothing is added to `requirements.txt`.
+
+What you get:
+
+| View | What it does |
+|---|---|
+| **Overview** | Event / session / profile counts, risk histogram by dataset label, risk-classification donut, per-artifact and per-process breakdowns, collection timeline, top flagged events, system health |
+| **Events** | Filter by session, artifact, access type, risk level or free text; paginate; click a row for the full per-factor probability breakdown (`score_event`) |
+| **Detection** | Train the Bayesian Network (`train`), score everything and write `alerts.json` (`score-all --report`), evaluate both layers (`evaluate` + `sequences.evaluate`) with a confusion matrix |
+| **Chains** | Run the order-aware rules over the stored sessions, show recall vs. false positives, the fired rules, the tunables, and every match with its event ids |
+| **Baseline** | Recompute profiles (`baseline.py --reset`) and browse them per artifact / process / user |
+| **Exports** | CSV/JSON downloads of the events table (honoring every active filter), plus baseline CSV, chain scan CSV/JSON and an alerts CSV |
+| **Collector** | Start and stop `collector.py` (SIGINT first, so audit rules are removed), show the monitored paths and their existence, tail the live log, and run `demo.sh` |
+| **Alerts** | Show the sink configuration (`alerts.py`), run a sink self-test, read `alerts.json`, and download the alert / chain reports |
+| **Data** | Regenerate the seeded dataset, run the whole pipeline (generate → baseline → train → score → evaluate → chain scan), **import uploaded CSV/JSON events** into the same table and optionally analyze them, and clear the tables |
+
+Long-running actions stream their stdout into an **Activity** drawer, so a
+training run or the live demo shows its own log as it happens.
+
+### API
+
+The UI is a plain JSON client, so the same endpoints are usable from scripts:
+
+```
+GET  /api/overview /api/stats /api/events /api/event?id=N /api/baseline
+     /api/model /api/chains /api/alerts /api/reports /api/policy
+     /api/jobs /api/job?id=ID /api/collector /api/collector/log?tail=400
+GET  /api/export?dataset=events|baseline|chains|alerts&format=csv|json
+     [&session=..&artifact=..&access_type=..&risk_level=..&q=..&order=..]
+POST /api/generate /api/pipeline /api/baseline/compute /api/model/train
+     /api/score-all /api/evaluate /api/chains/scan /api/alerts/test
+     /api/upload /api/db/clear /api/collector/start /api/collector/stop /api/demo
+```
+
+Action endpoints return `202 {"job": {...}}`; poll `GET /api/job?id=...` for
+status, streamed output and the result.
+
+`/api/export` streams a file attachment built from the *same* filters, scoring
+cache and chain scan the views render, so an export cannot disagree with the
+table on screen. Example: download every flagged AWS event as CSV.
+
+```bash
+curl -OJ 'http://127.0.0.1:8765/api/export?dataset=events&format=csv&artifact=aws&risk_level=suspicious'
+```
+
+> The dashboard binds to `127.0.0.1` by default. `--host 0.0.0.0` exposes an
+> API that can start the collector and rewrite the database — only do that on a
+> trusted network.
 
 ## The Model
 
@@ -161,6 +226,10 @@ Key properties:
 
 - **Trained on normal only** — events with `session_id LIKE 'attack_%'` are
   excluded from training and held out for evaluation.
+- **Fixed account vocabulary** — the modelled users are `root` and `debian`;
+  every other account collapses to `other`, exactly as an unknown process does.
+  The state space never depends on the login running the detector, so the same
+  seed trains the same model on any machine.
 - **Laplace smoothing** (α=1.0) handles unseen feature combinations.
 - **Sweep size gets 2× weight** — `session_size` counts *distinct files touched
   in the session*, which is the credential-sweep signature, so it is
@@ -276,6 +345,8 @@ slightly, though detection performance is unaffected.
 ```
 DEMO_RUNBOOK.md         Step-by-step presentation flow, commands, fallbacks
 PRESENTATION.md         5-minute talk script + anticipated Q&A
+dashboard.py            Web dashboard: stdlib HTTP server + JSON API (no new deps)
+dashboard.html          Dashboard UI (single page, no external assets, no CDN)
 demo.sh                 The live demo (benign/chain/sweep) as one command
 policy_v2.yaml          Monitoring targets (5 credential categories)
 artifact_scan.py        TUI browser for building the policy
@@ -289,7 +360,7 @@ ml/generate_test_events.py  Labeled synthetic data generator
 sequences.py            Order-aware chain rules + CLI
 ml/anomaly_model.json   Trained model (auto-generated)
 alerts.py               Optional syslog / webhook alert sinks
-tests/                  Unit + end-to-end tests (81, stdlib unittest, no new deps)
+tests/                  Unit + end-to-end tests (82, stdlib unittest, no new deps)
 alerts.json             Alert report (auto-generated, gitignored)
 collector.db            SQLite database (auto-created)
 ```

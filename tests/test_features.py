@@ -154,6 +154,23 @@ class TestExtractEventFeatures(unittest.TestCase):
             self.assertIn(value, states, f"{node}={value} not in {states}")
 
 
+class TestUserStateSpace(unittest.TestCase):
+    """The modelled accounts must be fixed, not read from the environment.
+
+    Regression: KNOWN_USERS used to include ``os.getenv("USER")``, so the
+    user state space — and therefore every trained model, and the CPDs in it —
+    depended on the login name of the machine running the detector. On a box
+    logged in as anything but ``debian``, the dataset's ``debian`` events
+    collapsed to "other" and the model silently learned a different state set.
+    """
+
+    def test_states_are_the_documented_set(self):
+        # root / debian / other is what README.md and the dataset generator
+        # assume; anything else means the environment leaked back in.
+        self.assertEqual(ad.KNOWN_USERS, ["root", "debian"])
+        self.assertEqual(ad.NODE_STATES["user"], ["root", "debian", "other"])
+
+
 class TestCpdHelpers(unittest.TestCase):
     def test_root_cpd_is_a_distribution(self):
         cpd = ad._build_cpd_from_counts(

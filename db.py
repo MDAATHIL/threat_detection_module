@@ -123,8 +123,13 @@ def insert_event(
     time_delta: float | None = None,
     session_id: str | None = None,
     files_in_session: int | None = None,
+    timestamp: str | None = None,
 ) -> int:
-    """Insert a filesystem access event. Returns the new row id."""
+    """Insert a filesystem access event. Returns the new row id.
+
+    `timestamp` defaults to now (UTC). Pass an explicit ISO-8601 value when
+    importing recorded events so their original time is preserved.
+    """
     conn = get_conn()
     cur = conn.execute(
         """
@@ -135,7 +140,7 @@ def insert_event(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            datetime.now(timezone.utc).isoformat(),
+            timestamp or datetime.now(timezone.utc).isoformat(),
             artifact_path,
             access_type,
             pid,

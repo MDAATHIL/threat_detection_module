@@ -345,6 +345,8 @@ def generate_events(num_per_artifact: int = 80, include_attacks: bool = True):
               + " and low-and-slow chains ("
               + ", ".join(c["name"] for c in CHAIN_ATTACKS) + ")")
 
+    return total
+
 
 def _pick_access_type(template: dict, path: str) -> str:
     """Pick an access type that is realistic for this specific file.
@@ -435,6 +437,21 @@ def _generate_normal_session_events(conn, artifact, template, target, base_date)
     return emitted
 
 
+def generate_dataset(seed: int = 42, num_per_artifact: int = 80,
+                     include_attacks: bool = True) -> int:
+    """Seed the RNG, initialize the DB, and generate the labeled dataset.
+
+    This is exactly what the CLI does, exposed as a function so the dashboard
+    can reproduce a seeded dataset without shelling out. Returns the number of
+    events generated.
+    """
+    random.seed(seed)
+    print(f"Random seed: {seed}")
+    init_db()
+    return generate_events(num_per_artifact=num_per_artifact,
+                           include_attacks=include_attacks)
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Generate labeled synthetic events")
@@ -442,7 +459,4 @@ if __name__ == "__main__":
                         help="Random seed (default 42 — same seed = same dataset)")
     args = parser.parse_args()
 
-    random.seed(args.seed)
-    print(f"Random seed: {args.seed}")
-    init_db()
-    generate_events()
+    generate_dataset(seed=args.seed)

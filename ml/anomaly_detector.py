@@ -8,18 +8,22 @@ Uses pgmpy to build a Discrete Bayesian Network over event features
 new events against learned normal behavior.
 
 Network structure:
-    artifact ──┬── process
-               ├── user
-               ├── access_type
-               └── hour ── day_of_week
+    artifact ──┬── process ── time_delta ── session_size
+               ├── user ── hour_bucket ── day_bucket
+               └── access_type
 
 Scoring:
     P(event) = P(artifact) × P(process|artifact) × P(user|artifact)
-               × P(access_type|artifact) × P(hour|process,user)
-               × P(day_of_week|hour)
+               × P(access_type|artifact) × P(hour|user)
+               × P(day_of_week|hour) × P(time_delta|process)
+               × P(session_size|time_delta)
 
-Low P(event) → anomaly.  Each conditional probability is reported for
-explainability.
+An event is anomalous when ONE of its factors is highly improbable — an
+attack is a burst of rare values surrounded by ordinary ones. The risk
+score is therefore driven by the strongest weighted surprise
+(`S = max_i w_i · -ln P_i`) rather than the sum of all factors, which would
+dilute a single strong signal.  Each conditional probability is reported
+for explainability.
 
 Usage:
     python anomaly_detector.py train              # learn from historical events
@@ -34,25 +38,13 @@ Usage:
 import json
 import logging
 import math
-import os
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
-try:
-    from sklearn.metrics import (
-        accuracy_score, precision_score, recall_score,
-        f1_score, confusion_matrix, classification_report,
-        roc_auc_score, average_precision_score,
-    )
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
-
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from db import get_conn, init_db
 
@@ -73,7 +65,13 @@ KNOWN_PROCESSES = [
     "curl", "wget", "ssh", "grep", "less",
 ]
 
-KNOWN_USERS = ["root", os.getenv("USER", "debian")]
+# The user state space is fixed, NOT derived from the login running the
+# detector. Any account that is not one of these collapses to "other", the
+# same way every unlisted process does. Reading $USER here made the state
+# space — and therefore every trained model — depend on the machine: on a box
+# logged in as anything but `debian`, `debian` events collapsed to "other" and
+# the model silently learned a different set of states.
+KNOWN_USERS = ["root", "debian"]
 
 KNOWN_ACCESS_TYPES = ["read", "write", "create", "delete", "moved"]
 
@@ -162,7 +160,7 @@ def extract_event_features(event_row) -> dict:
     try:
         dt = datetime.fromisoformat(ts_str)
     except (ValueError, TypeError):
-        dt = datetime.utcnow()
+        dt = datetime.now(timezone.utc)
 
     # Artifact — extract category (last meaningful directory name)
     artifact_path = event_row["artifact_path"] or "unknown"
@@ -248,9 +246,30 @@ BN_EDGES = [
     ("hour_bucket", "day_bucket"),
     # NEW: Timing edges for burst/frequency detection
     ("process", "time_delta"),      # automation tools have fast deltas
-    ("process", "session_size"),    # automation tools process many files
-    ("time_delta", "session_size"), # fast deltas = large sessions
+    ("time_delta", "session_size"), # fast sessions sweep more files
 ]
+
+# ---------------------------------------------------------------------------
+# Risk scoring calibration
+# ---------------------------------------------------------------------------
+# Surprise weights per factor. `session_size` counts DISTINCT files touched in
+# the session — that is the credential-sweep signature — so it is weighted 2x.
+# Raw inter-event `time_delta` keeps 1x: it is noisy, because every ordinary
+# file access emits a sub-second cluster of inotify events, so a fast delta on
+# its own is not evidence of anything.
+FACTOR_WEIGHTS = {"session_size": 2.0}
+
+# Linear map from weighted surprise S to a 0-100 risk score:
+#     risk = 100 · clip((S - SURPRISE_FLOOR) / (SURPRISE_CEIL - SURPRISE_FLOOR))
+# Calibrated against the seeded (42) labeled dataset — see `evaluate`:
+#     normal events  S <= 3.83  ->  risk <= 25.7
+#     attack events  S 8.74–10.29 -> risk 70.4–84.5
+# The thresholds sit inside that measured gap.
+SURPRISE_FLOOR = 1.0
+SURPRISE_CEIL = 12.0
+RISK_UNUSUAL = 40
+RISK_SUSPICIOUS = 45
+RISK_ANOMALY = 85
 
 
 # ---------------------------------------------------------------------------
@@ -455,11 +474,14 @@ class AnomalyDetector:
         for f in features_list:
             time_given_process[f["process"]][f["time_delta"]] += 1
 
-        # NEW: P(session_size | process, time_delta) - multi-parent
-        session_given_both = defaultdict(lambda: defaultdict(int))
+        # P(session_size | time_delta) — a fast-moving session is more likely
+        # to sweep many files. Conditioning on `process` as well would create
+        # ~300 cells for ~400 normal events; with that little data per cell,
+        # Laplace smoothing hands unseen burst sessions (~1/8) a probability
+        # that masks the very signal we are looking for.
+        session_given_time = defaultdict(lambda: defaultdict(int))
         for f in features_list:
-            key = (f["process"], f["time_delta"])
-            session_given_both[key][f["session_size"]] += 1
+            session_given_time[f["time_delta"]][f["session_size"]] += 1
 
         # --- Build CPDs ---
         log.info("Building CPDs with Laplace smoothing (alpha=1.0)...")
@@ -516,15 +538,11 @@ class AnomalyDetector:
             parent_states=states["process"],
         )
 
-        cpd_session_size = _build_cpd_multi_parent(
-            variable="session_size",
-            parents=["process", "time_delta"],
-            counts=dict(session_given_both),
+        cpd_session_size = _build_cpd_from_counts(
+            variable="session_size", parent="time_delta",
+            counts=dict(session_given_time),
             variable_states=states["session_size"],
-            parent_states_map={
-                "process": states["process"],
-                "time_delta": states["time_delta"],
-            },
+            parent_states=states["time_delta"],
         )
 
         # Add CPDs to model
@@ -548,12 +566,6 @@ class AnomalyDetector:
         }
         log.info("Model trained: %d events → %d nodes, %d edges",
                  len(rows), len(self.model.nodes()), len(self.model.edges()))
-
-        # Evaluate model performance on all events
-        log.info("Evaluating model on all events...")
-        eval_metrics = self._evaluate_model()
-        summary["evaluation"] = eval_metrics
-
         return summary
 
     def _build_uniform_model(self) -> dict:
@@ -569,92 +581,55 @@ class AnomalyDetector:
         self.model = DiscreteBayesianNetwork(ebunch=BN_EDGES)
         states = self.variable_states
 
-        # Uniform CPDs
         from pgmpy.factors.discrete import TabularCPD
 
-        n_art = len(states["artifact"])
-        cpd_artifact = TabularCPD(
-            variable="artifact", variable_card=n_art,
-            values=[[1.0 / n_art]] * n_art,
-            state_names={"artifact": states["artifact"]},
-        )
+        def uniform_cpd(variable: str, parent: str | None = None) -> TabularCPD:
+            """CPD whose distribution over `variable` is uniform.
 
-        n_proc = len(states["process"])
-        # P(process | artifact) — uniform for each artifact
-        cpd_process = TabularCPD(
-            variable="process", variable_card=n_proc,
-            values=[[1.0 / n_proc]] * n_proc,
-            evidence=["artifact"], evidence_card=[n_art],
-            state_names={"process": states["process"], "artifact": states["artifact"]},
-        )
+            pgmpy requires shape (variable_card, prod(evidence_card)), i.e. one
+            column per parent state — not (variable_card, 1).
+            """
+            n_var = len(states[variable])
+            if parent is None:
+                return TabularCPD(
+                    variable=variable, variable_card=n_var,
+                    values=np.full((n_var, 1), 1.0 / n_var),
+                    state_names={variable: states[variable]},
+                )
+            n_par = len(states[parent])
+            return TabularCPD(
+                variable=variable, variable_card=n_var,
+                values=np.full((n_var, n_par), 1.0 / n_var),
+                evidence=[parent], evidence_card=[n_par],
+                state_names={variable: states[variable], parent: states[parent]},
+            )
 
-        n_user = len(states["user"])
-        cpd_user = TabularCPD(
-            variable="user", variable_card=n_user,
-            values=[[1.0 / n_user]] * n_user,
-            evidence=["artifact"], evidence_card=[n_art],
-            state_names={"user": states["user"], "artifact": states["artifact"]},
-        )
-
-        n_acc = len(states["access_type"])
-        cpd_access = TabularCPD(
-            variable="access_type", variable_card=n_acc,
-            values=[[1.0 / n_acc]] * n_acc,
-            evidence=["artifact"], evidence_card=[n_art],
-            state_names={"access_type": states["access_type"], "artifact": states["artifact"]},
-        )
-
-        n_hour = len(states["hour_bucket"])
-        cpd_hour = TabularCPD(
-            variable="hour_bucket", variable_card=n_hour,
-            values=[[1.0 / n_hour]] * n_hour,
-            evidence=["user"], evidence_card=[n_user],
-            state_names={
-                "hour_bucket": states["hour_bucket"],
-                "user": states["user"],
-            },
-        )
-
-        n_day = len(states["day_bucket"])
-        cpd_day = TabularCPD(
-            variable="day_bucket", variable_card=n_day,
-            values=[[1.0 / n_day]] * n_day,
-            evidence=["hour_bucket"], evidence_card=[n_hour],
-            state_names={"day_bucket": states["day_bucket"], "hour_bucket": states["hour_bucket"]},
-        )
-
-        # NEW: CPDs for timing nodes (uniform)
         n_time = len(states["time_delta"])
-        cpd_time_delta = TabularCPD(
-            variable="time_delta", variable_card=n_time,
-            values=[[1.0 / n_time]] * n_time,
-            evidence=["process"], evidence_card=[n_proc],
-            state_names={"time_delta": states["time_delta"], "process": states["process"]},
-        )
-
         n_session = len(states["session_size"])
         cpd_session_size = TabularCPD(
             variable="session_size", variable_card=n_session,
-            values=[[1.0 / n_session]] * n_session,
-            evidence=["process", "time_delta"],
-            evidence_card=[n_proc, n_time],
+            values=np.full((n_session, n_time), 1.0 / n_session),
+            evidence=["time_delta"],
+            evidence_card=[n_time],
             state_names={
                 "session_size": states["session_size"],
-                "process": states["process"],
                 "time_delta": states["time_delta"],
             },
         )
 
-        self.model.add_cpds(cpd_artifact, cpd_process, cpd_user,
-                            cpd_access, cpd_hour, cpd_day,
-                            cpd_time_delta, cpd_session_size)
+        self.model.add_cpds(
+            uniform_cpd("artifact"),
+            uniform_cpd("process", "artifact"),
+            uniform_cpd("user", "artifact"),
+            uniform_cpd("access_type", "artifact"),
+            uniform_cpd("hour_bucket", "user"),
+            uniform_cpd("day_bucket", "hour_bucket"),
+            uniform_cpd("time_delta", "process"),
+            cpd_session_size,
+        )
         assert self.model.check_model(), "Uniform model validation failed!"
         self._trained = True
         self._save_model()
-
-        # Evaluate model performance on all events
-        log.info("Evaluating model on all events...")
-        eval_metrics = self._evaluate_model()
 
         return {
             "events_trained": 0,
@@ -662,7 +637,6 @@ class AnomalyDetector:
             "nodes": list(self.model.nodes()),
             "edges": [list(e) for e in self.model.edges()],
             "mode": "uniform_priors",
-            "evaluation": eval_metrics,
         }
 
     # -------------------------------------------------------------------
@@ -750,53 +724,44 @@ class AnomalyDetector:
         factors.append({"variable": "time_delta", "parent": "process",
                         "probability": p, "normal": p > 0.05})
 
-        # NEW: P(session_size | process, time_delta)
+        # P(session_size | time_delta)
         cpd = self.model.get_cpds("session_size")
         p = self._lookup_cpd(cpd, "session_size", features["session_size"],
-                             {"process": features["process"],
-                              "time_delta": features["time_delta"]})
+                             {"time_delta": features["time_delta"]})
         log_score += math.log(max(p, 1e-15))
-        factors.append({"variable": "session_size", "parent": "process+time_delta",
+        factors.append({"variable": "session_size", "parent": "time_delta",
                         "probability": p, "normal": p > 0.05})
 
-        # --- Weighted scoring: timing anomalies get 2x weight ---
-        # Weight time_delta and session_size factors more heavily
-        weighted_factors = []
+        # --- Risk score: strongest weighted surprise ---
+        # Summing every factor's log-probability dilutes a lone strong signal,
+        # so the score is driven by the single most improbable factor.
+        worst_surprise = 0.0
+        worst_factor = None
         for f in factors:
-            weight = 2.0 if f["variable"] in ("time_delta", "session_size") else 1.0
-            weighted_factors.append((f["probability"], weight))
-        
-        # Weighted log-score
-        weighted_log_score = sum(
-            weight * math.log(max(p, 1e-15)) for p, weight in weighted_factors
-        )
-        
-        # Normalized scoring using weighted log-probability ratio
-        n_factors = len(factors)
-        min_p = 1e-3  # floor probability for worst case
-        best_log_score = 0.0
-        worst_log_score = sum(
-            weight * math.log(min_p) for _, weight in weighted_factors
-        )
-        
-        gap = best_log_score - weighted_log_score
-        max_gap = best_log_score - worst_log_score
-        
-        normalized = gap / max_gap if max_gap > 0 else 0.0
+            weight = FACTOR_WEIGHTS.get(f["variable"], 1.0)
+            surprise = weight * -math.log(max(f["probability"], 1e-15))
+            f["weight"] = weight
+            f["surprise"] = surprise
+            if surprise > worst_surprise:
+                worst_surprise = surprise
+                worst_factor = f
+
+        # Linear calibration onto the 0-100 scale (see constants above).
+        span = SURPRISE_CEIL - SURPRISE_FLOOR
+        normalized = (worst_surprise - SURPRISE_FLOOR) / span if span > 0 else 0.0
         normalized = max(0.0, min(1.0, normalized))
 
         # Score = how normal (0-1), risk = how anomalous (0-100)
         score = 1.0 - normalized
         risk_score = normalized * 100.0
 
-        # Risk level classification
-        # Calibrated on labeled data: normal events max risk ~22.3,
-        # attack events min risk ~27.9 (see `evaluate` command).
-        if risk_score >= 45:
+        # Risk level classification (thresholds calibrated on labeled data —
+        # normal events max out at risk 25.7, attacks start at 70.4).
+        if risk_score >= RISK_ANOMALY:
             risk_level = "anomaly"
-        elif risk_score >= 27:
+        elif risk_score >= RISK_SUSPICIOUS:
             risk_level = "suspicious"
-        elif risk_score >= 23:
+        elif risk_score >= RISK_UNUSUAL:
             risk_level = "unusual"
         else:
             risk_level = "normal"
@@ -820,6 +785,8 @@ class AnomalyDetector:
             "features": features,
             "score": score,
             "log_score": log_score,
+            "weighted_surprise": worst_surprise,
+            "worst_factor": worst_factor["variable"] if worst_factor else None,
             "risk_level": risk_level,
             "risk_score": risk_score,
             "factors": factors,
@@ -831,12 +798,17 @@ class AnomalyDetector:
         """Look up a probability from a CPD given variable value and evidence.
 
         Handles 1D (scalar root), 2D (single-parent), and nD (multi-parent) CPDs.
-        Uses 2D linear indexing to avoid pgmpy's internal dimension reordering.
+        pgmpy internally stores multi-parent CPDs as nD arrays where each
+        dimension corresponds to one parent in evidence order.
         """
         var_states = cpd.state_names[variable]
         var_idx = var_states.index(var_value) if var_value in var_states else 0
 
-        evidence_vars = cpd.get_evidence() or []
+        # NOTE: pgmpy's `get_evidence()` returns the parents REVERSED
+        # (`self.variables[:0:-1]`), while `cpd.values` is laid out as
+        # `[variable] + evidence` in construction order. Use `cpd.variables`
+        # directly so the indices line up with the array dimensions.
+        evidence_vars = list(cpd.variables[1:]) if len(cpd.variables) > 1 else []
         vals = cpd.values
 
         if not evidence_vars or vals.ndim == 1:
@@ -845,24 +817,16 @@ class AnomalyDetector:
                 return float(vals[0]) if len(vals) == 1 else float(vals[var_idx])
             return float(vals[var_idx][0])
 
-        # Flatten to 2D and compute linear column index.
-        # pgmpy may reorder evidence variables alphabetically in its nD
-        # representation, so we avoid nD indexing entirely and instead
-        # compute the column index from the 2D [var_card × prod(evidence_cards)]
-        # layout using the evidence order from get_evidence().
-        vals_2d = vals.reshape(vals.shape[0], -1) if vals.ndim > 2 else vals
-
-        col_idx = 0
-        multiplier = 1
-        # Walk evidence in reverse to build column index (last var varies fastest)
-        for ev_var in reversed(evidence_vars):
+        # Build multi-dimensional index for nD arrays
+        # pgmpy orders dimensions as [var, evidence_var_0, evidence_var_1, ...]
+        indices = [var_idx]
+        for ev_var in evidence_vars:
             ev_states = cpd.state_names[ev_var]
             ev_val = evidence.get(ev_var, ev_states[0])
             ev_idx = ev_states.index(ev_val) if ev_val in ev_states else 0
-            col_idx += ev_idx * multiplier
-            multiplier *= len(ev_states)
+            indices.append(ev_idx)
 
-        return float(vals_2d[var_idx, col_idx])
+        return float(vals[tuple(indices)])
 
     # -------------------------------------------------------------------
     # Batch scoring
@@ -883,140 +847,6 @@ class AnomalyDetector:
             results.append(result)
         return results
 
-    def _evaluate_model(self, risk_threshold: float = 50.0) -> dict:
-        """Evaluate model by scoring all events and computing metrics.
-
-        Ground truth is derived from session_id: events with session_id
-        starting with 'attack_' are labeled as attacks (positive class).
-        Predictions use risk_score >= risk_threshold as anomaly.
-
-        Also finds the optimal threshold that maximizes F1 score and reports
-        metrics at that threshold.
-
-        Returns dict with metrics: accuracy, precision, recall, f1,
-        specificity, auc_roc, auc_pr, confusion matrix, and counts.
-        """
-        results = self.score_all_events()
-        if not results:
-            return {"error": "No events to evaluate"}
-
-        # Get session_ids for ground truth
-        conn = get_conn()
-        rows = conn.execute(
-            "SELECT id, session_id FROM events ORDER BY timestamp"
-        ).fetchall()
-        conn.close()
-
-        session_map = {row["id"]: row["session_id"] for row in rows}
-
-        y_true = []   # 1 = attack, 0 = normal
-        y_scores = []  # risk_score (0-100)
-
-        for r in results:
-            eid = r["event_id"]
-            session_id = session_map.get(eid, "")
-            is_attack = 1 if session_id and session_id.startswith("attack_") else 0
-            risk = r["risk_score"]
-
-            y_true.append(is_attack)
-            y_scores.append(risk)
-
-        y_true = np.array(y_true)
-        y_scores = np.array(y_scores)
-
-        total = len(y_true)
-        n_attacks = int(y_true.sum())
-        n_normal = total - n_attacks
-
-        def _compute_metrics_at_threshold(thresh):
-            """Compute metrics for a given risk threshold."""
-            y_pred = (y_scores >= thresh).astype(int)
-            tp = int(((y_pred == 1) & (y_true == 1)).sum())
-            fp = int(((y_pred == 1) & (y_true == 0)).sum())
-            tn = int(((y_pred == 0) & (y_true == 0)).sum())
-            fn = int(((y_pred == 0) & (y_true == 1)).sum())
-            acc = (tp + tn) / total if total > 0 else 0.0
-            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-            f1_ = (2 * prec * rec / (prec + rec)
-                   if (prec + rec) > 0 else 0.0)
-            return {
-                "threshold": round(thresh, 1),
-                "confusion_matrix": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
-                "accuracy": round(acc, 4),
-                "precision": round(prec, 4),
-                "recall": round(rec, 4),
-                "f1_score": round(f1_, 4),
-                "specificity": round(spec, 4),
-            }
-
-        # --- Metrics at requested threshold ---
-        metrics = _compute_metrics_at_threshold(risk_threshold)
-        metrics["total_events"] = total
-        metrics["attack_events"] = n_attacks
-        metrics["normal_events"] = n_normal
-
-        # --- Find optimal threshold by maximizing F1 ---
-        best_f1 = -1.0
-        best_thresh = risk_threshold
-        # Search thresholds from 1 to 99 in 0.5 steps
-        for t in np.arange(1.0, 100.0, 0.5):
-            y_pred_t = (y_scores >= t).astype(int)
-            tp_t = int(((y_pred_t == 1) & (y_true == 1)).sum())
-            fp_t = int(((y_pred_t == 1) & (y_true == 0)).sum())
-            fn_t = int(((y_pred_t == 0) & (y_true == 1)).sum())
-            p_t = tp_t / (tp_t + fp_t) if (tp_t + fp_t) > 0 else 0.0
-            r_t = tp_t / (tp_t + fn_t) if (tp_t + fn_t) > 0 else 0.0
-            f1_t = (2 * p_t * r_t / (p_t + r_t)
-                    if (p_t + r_t) > 0 else 0.0)
-            if f1_t > best_f1:
-                best_f1 = f1_t
-                best_thresh = t
-
-        optimal_metrics = _compute_metrics_at_threshold(best_thresh)
-        metrics["optimal"] = optimal_metrics
-
-        # --- sklearn metrics (at requested threshold) ---
-        y_pred_default = (y_scores >= risk_threshold).astype(int)
-        if HAS_SKLEARN and total > 1:
-            try:
-                metrics["accuracy_sklearn"] = round(
-                    float(accuracy_score(y_true, y_pred_default)), 4)
-                metrics["precision_sklearn"] = round(
-                    float(precision_score(y_true, y_pred_default, zero_division=0)), 4)
-                metrics["recall_sklearn"] = round(
-                    float(recall_score(y_true, y_pred_default, zero_division=0)), 4)
-                metrics["f1_sklearn"] = round(
-                    float(f1_score(y_true, y_pred_default, zero_division=0)), 4)
-                metrics["classification_report"] = classification_report(
-                    y_true, y_pred_default, target_names=["normal", "attack"],
-                    zero_division=0,
-                )
-            except Exception as e:
-                log.debug("sklearn basic metrics failed: %s", e)
-
-            # AUC-ROC (needs both classes present)
-            if len(np.unique(y_true)) > 1:
-                try:
-                    metrics["auc_roc"] = round(
-                        float(roc_auc_score(y_true, y_scores)), 4)
-                except Exception as e:
-                    log.debug("AUC-ROC failed: %s", e)
-                try:
-                    metrics["auc_pr"] = round(
-                        float(average_precision_score(y_true, y_scores)), 4)
-                except Exception as e:
-                    log.debug("AUC-PR failed: %s", e)
-            else:
-                metrics["auc_roc"] = None
-                metrics["auc_pr"] = None
-                metrics["auc_note"] = "Only one class present; AUC undefined"
-        elif not HAS_SKLEARN:
-            metrics["sklearn_note"] = "Install scikit-learn for extended metrics (AUC, report)"
-
-        return metrics
-
     # -------------------------------------------------------------------
     # Model persistence
     # -------------------------------------------------------------------
@@ -1028,7 +858,9 @@ class AnomalyDetector:
         # Serialize CPDs
         cpds_data = []
         for cpd in self.model.get_cpds():
-            evidence = cpd.get_evidence()
+            # Store parents in construction order (matches `cpd.values` layout);
+            # `get_evidence()` would reverse them and corrupt the reload.
+            evidence = list(cpd.variables[1:])
             # evidence_card: cardinality of each parent (skip first element which is self)
             all_card = list(cpd.cardinality)
             evidence_card = all_card[1:] if len(all_card) > 1 else []
@@ -1096,6 +928,123 @@ class AnomalyDetector:
 
 
 # ---------------------------------------------------------------------------
+# Reusable evaluation / reporting helpers
+# ---------------------------------------------------------------------------
+# These wrap the logic the CLI prints, so the dashboard (and any other caller)
+# can reuse it instead of shelling out and scraping stdout.
+
+RISK_LEVELS = ("normal", "unusual", "suspicious", "anomaly")
+FLAGGED_LEVELS = ("unusual", "suspicious", "anomaly")
+
+
+def summarize_levels(results: list[dict]) -> dict[str, int]:
+    """Count scored events per risk level (unknown levels collapse to normal)."""
+    levels = {level: 0 for level in RISK_LEVELS}
+    for r in results:
+        level = r.get("risk_level", "normal")
+        if level not in levels:
+            level = "normal"
+        levels[level] += 1
+    return levels
+
+
+def evaluate(detector: "AnomalyDetector | None" = None) -> dict:
+    """Evaluate the per-event Bayesian Network against the labeled dataset.
+
+    Two labeled attack families, two layers:
+      attack_burst_*  per-event statistical anomalies — the BN's job
+      attack_chain_*  low-and-slow multi-step chains — the sequence layer's
+                      job; the BN is blind to them by design, so they are
+                      excluded from its confusion matrix and reported
+                      separately rather than hidden.
+
+    Returns a dict with the confusion matrix, precision/recall/F1/accuracy and
+    the label counts (``events`` is 0 when there is nothing to evaluate).
+    """
+    detector = detector or AnomalyDetector()
+    if detector.model is None:
+        detector.load_model()
+
+    results = detector.score_all_events()
+    if not results:
+        return {"events": 0}
+
+    conn = get_conn()
+    id_rows = conn.execute("SELECT id, session_id FROM events").fetchall()
+    conn.close()
+
+    def _ids_with_prefix(prefix: str) -> set[int]:
+        return {r["id"] for r in id_rows
+                if str(r["session_id"] or "").startswith(prefix)}
+
+    burst_ids = _ids_with_prefix("attack_burst_")
+    chain_ids = _ids_with_prefix("attack_chain_")
+    # Any other attack-prefixed session is treated as a burst attack so
+    # older datasets keep evaluating the same way.
+    burst_ids |= (_ids_with_prefix("attack_") - chain_ids - burst_ids)
+    normal_ids = {r["id"] for r in id_rows} - burst_ids - chain_ids
+
+    flagged_ids = {r["event_id"] for r in results
+                   if r["risk_level"] in FLAGGED_LEVELS}
+
+    tp = len(burst_ids & flagged_ids)
+    fn = len(burst_ids - flagged_ids)
+    fp = len(normal_ids & flagged_ids)
+    tn = len(normal_ids - flagged_ids)
+
+    scored = tp + fn + fp + tn
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    accuracy = (tp + tn) / scored if scored else 0.0
+
+    return {
+        "events": len(results),
+        "burst_events": len(burst_ids),
+        "chain_events": len(chain_ids),
+        "normal_events": len(normal_ids),
+        "tp": tp,
+        "fn": fn,
+        "fp": fp,
+        "tn": tn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "accuracy": accuracy,
+        "flagged_events": len(flagged_ids),
+        "chain_flagged": len(chain_ids & flagged_ids),
+        "chain_total": len(chain_ids),
+        "levels": summarize_levels(results),
+    }
+
+
+def write_alerts_report(results: list[dict], path: str | Path = "alerts.json") -> dict:
+    """Write the machine-readable alert report (`score-all --report`) and
+    return the report dict that was written."""
+    levels = summarize_levels(results)
+    anomalies = [r for r in results if r["risk_level"] != "normal"]
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "total_events": len(results),
+        "summary": {level: levels.get(level, 0) for level in RISK_LEVELS},
+        "alerts": [
+            {
+                "event_id": r["event_id"],
+                "risk_level": r["risk_level"],
+                "risk_score": round(r["risk_score"], 2),
+                "score": round(r["score"], 8),
+                "features": r.get("features", {}),
+                "explanation": r.get("explanation", ""),
+                "factors": r.get("factors", []),
+            }
+            for r in sorted(anomalies, key=lambda x: -x["risk_score"])
+        ],
+    }
+    Path(path).write_text(json.dumps(report, indent=2))
+    return report
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1156,61 +1105,6 @@ def main():
         if summary.get("mode") == "uniform_priors":
             print(f"  Mode:         Uniform priors (insufficient data)")
 
-        # Print evaluation metrics
-        eval_m = summary.get("evaluation", {})
-        if eval_m and "error" not in eval_m:
-            # --- Default threshold ---
-            print(f"\n{'='*50}")
-            print(f"Model Evaluation (threshold={eval_m.get('threshold', 50)})")
-            print(f"{'='*50}")
-            print(f"  Total events:  {eval_m['total_events']}")
-            print(f"  Attack events: {eval_m['attack_events']}")
-            print(f"  Normal events: {eval_m['normal_events']}")
-            cm = eval_m.get('confusion_matrix', {})
-            print(f"\n  Confusion Matrix:")
-            print(f"                  Predicted")
-            print(f"                  Normal  Attack")
-            print(f"    Actual Normal  {cm.get('tn',0):>5}  {cm.get('fp',0):>5}")
-            print(f"    Actual Attack  {cm.get('fn',0):>5}  {cm.get('tp',0):>5}")
-            print(f"\n  Metrics:")
-            print(f"    Accuracy:    {eval_m.get('accuracy', 'N/A')}")
-            print(f"    Precision:   {eval_m.get('precision', 'N/A')}")
-            print(f"    Recall:      {eval_m.get('recall', 'N/A')}")
-            print(f"    F1 Score:    {eval_m.get('f1_score', 'N/A')}")
-            print(f"    Specificity: {eval_m.get('specificity', 'N/A')}")
-            if eval_m.get('auc_roc') is not None:
-                print(f"    AUC-ROC:     {eval_m['auc_roc']}")
-            if eval_m.get('auc_pr') is not None:
-                print(f"    AUC-PR:      {eval_m['auc_pr']}")
-            # --- Optimal threshold ---
-            opt = eval_m.get('optimal', {})
-            if opt and opt.get('f1_score', 0) > 0:
-                ocm = opt.get('confusion_matrix', {})
-                print(f"\n{'='*50}")
-                print(f"Optimal Threshold (max F1)")
-                print(f"{'='*50}")
-                print(f"  Threshold:     {opt.get('threshold', 'N/A')}")
-                print(f"\n  Confusion Matrix:")
-                print(f"                  Predicted")
-                print(f"                  Normal  Attack")
-                print(f"    Actual Normal  {ocm.get('tn',0):>5}  {ocm.get('fp',0):>5}")
-                print(f"    Actual Attack  {ocm.get('fn',0):>5}  {ocm.get('tp',0):>5}")
-                print(f"\n  Metrics:")
-                print(f"    Accuracy:    {opt.get('accuracy', 'N/A')}")
-                print(f"    Precision:   {opt.get('precision', 'N/A')}")
-                print(f"    Recall:      {opt.get('recall', 'N/A')}")
-                print(f"    F1 Score:    {opt.get('f1_score', 'N/A')}")
-                print(f"    Specificity: {opt.get('specificity', 'N/A')}")
-            if eval_m.get('classification_report'):
-                print(f"\n  Classification Report (threshold={eval_m.get('threshold', 50)}):")
-                for line in eval_m['classification_report'].splitlines():
-                    print(f"    {line}")
-            if eval_m.get('sklearn_note'):
-                print(f"\n  Note: {eval_m['sklearn_note']}")
-            print(f"{'='*50}")
-        elif eval_m.get('error'):
-            print(f"\n  Evaluation: {eval_m['error']}")
-
     elif cmd == "score":
         if len(sys.argv) < 3:
             print("Usage: python anomaly_detector.py score <event_id>")
@@ -1238,9 +1132,7 @@ def main():
             report_path = sys.argv[idx + 1] if len(sys.argv) > idx + 1 and not sys.argv[idx + 1].startswith("--") else "alerts.json"
 
         # Summary stats
-        levels = defaultdict(int)
-        for r in results:
-            levels[r["risk_level"]] += 1
+        levels = summarize_levels(results)
 
         print(f"\n{'='*70}")
         print(f"Scoring {len(results)} events")
@@ -1263,73 +1155,43 @@ def main():
 
         # Write JSON alert report
         if report_path:
-            report = {
-                "generated_at": datetime.utcnow().isoformat() + "Z",
-                "total_events": len(results),
-                "summary": {level: levels.get(level, 0)
-                            for level in ["normal", "unusual", "suspicious", "anomaly"]},
-                "alerts": [
-                    {
-                        "event_id": r["event_id"],
-                        "risk_level": r["risk_level"],
-                        "risk_score": round(r["risk_score"], 2),
-                        "score": round(r["score"], 8),
-                        "features": r.get("features", {}),
-                        "explanation": r.get("explanation", ""),
-                        "factors": r.get("factors", []),
-                    }
-                    for r in sorted(anomalies, key=lambda x: -x["risk_score"])
-                ],
-            }
-            Path(report_path).write_text(json.dumps(report, indent=2))
+            report = write_alerts_report(results, report_path)
             print(f"Report written: {report_path} ({len(report['alerts'])} alerts)")
 
     elif cmd == "evaluate":
-        # Evaluate detector against labeled data (session_id LIKE 'attack_%')
-        results = detector.score_all_events()
-        if not results:
+        summary = evaluate(detector)
+        if summary["events"] == 0:
             print("No events to evaluate.")
             sys.exit(0)
 
-        conn = get_conn()
-        id_rows = conn.execute("SELECT id, session_id FROM events").fetchall()
-        conn.close()
-        attack_ids = {r["id"] for r in id_rows if str(r["session_id"] or "").startswith("attack_")}
-
-        flagged_thresholds = ["unusual", "suspicious", "anomaly"]
-        tp = fp = tn = fn = 0
-        for r in results:
-            is_attack = r["event_id"] in attack_ids
-            is_flagged = r["risk_level"] in flagged_thresholds
-            if is_attack and is_flagged:
-                tp += 1
-            elif not is_attack and is_flagged:
-                fp += 1
-            elif not is_attack and not is_flagged:
-                tn += 1
-            else:
-                fn += 1
-
-        precision = tp / (tp + fp) if (tp + fp) else 0.0
-        recall = tp / (tp + fn) if (tp + fn) else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-        accuracy = (tp + tn) / len(results) if results else 0.0
+        tp, fn, fp, tn = summary["tp"], summary["fn"], summary["fp"], summary["tn"]
+        precision = summary["precision"]
+        recall = summary["recall"]
+        f1 = summary["f1"]
+        accuracy = summary["accuracy"]
+        chain_flagged = summary["chain_flagged"]
+        chain_total = summary["chain_total"]
 
         print(f"\n{'='*70}")
-        print(f"Evaluation — labeled attack data (session_id LIKE 'attack_%')")
+        print(f"Evaluation — labeled sessions (attack_burst_* / attack_chain_*)")
         print(f"{'='*70}")
-        print(f"  Total events:   {len(results)}  (attacks: {len(attack_ids)}, normal: {len(results) - len(attack_ids)})")
+        print(f"  Events:         {summary['events']}"
+              f"  (burst attacks: {summary['burst_events']},"
+              f" chain attacks: {summary['chain_events']},"
+              f" normal: {summary['normal_events']})")
         print(f"  Flag threshold: risk_level >= unusual")
-        print(f"\n  Confusion matrix:")
+        print(f"\n  Statistical layer — per-event Bayesian Network vs burst attacks:")
         print(f"                       Predicted")
         print(f"                 Attack     Normal")
         print(f"  Actual Attack  {tp:>6}    {fn:>6}")
         print(f"  Actual Normal  {fp:>6}    {tn:>6}")
-        print(f"\n  Metrics:")
         print(f"    Precision: {precision:.3f}   (of flagged events, how many were real attacks)")
         print(f"    Recall:    {recall:.3f}   (of real attacks, how many were caught)")
         print(f"    F1 score:  {f1:.3f}")
         print(f"    Accuracy:  {accuracy:.3f}")
+        print(f"\n  Sequence layer — order-aware rules (see `python sequences.py --evaluate`):")
+        print(f"    Chain events flagged by the BN alone: {chain_flagged}/{chain_total}"
+              f"   <- the per-event blind spot")
         print(f"{'='*70}\n")
 
     elif cmd == "explain":

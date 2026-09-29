@@ -1,0 +1,1405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threat Detection Dashboard</title>
+<style>
+  :root{
+    --bg:#0a0f1e; --bg2:#0e1526; --panel:#121a30; --panel2:#16203a;
+    --border:#22304f; --border2:#2c3d63;
+    --text:#e8eeff; --muted:#94a2c4; --dim:#6b7a9c;
+    --accent:#4f8cff; --accent-soft:rgba(79,140,255,.18);
+    --green:#37d67a; --yellow:#ffc043; --red:#ff5c72; --magenta:#c65cff; --cyan:#3ddbd9;
+    --track:#1c2744;
+    --radius:12px; --radius-sm:8px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:radial-gradient(1200px 600px at 50% -200px, #16233f 0%, var(--bg) 60%) no-repeat, var(--bg);
+    color:var(--text); font-family:var(--sans); font-size:14px; line-height:1.45;
+    min-height:100vh; padding-bottom:64px;
+  }
+  a{color:var(--accent)}
+  h1,h2,h3{margin:0;font-weight:650;letter-spacing:.2px}
+  h2{font-size:15px}
+  h3{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}
+  code,pre,.mono{font-family:var(--mono)}
+
+  /* ---------- layout ---------- */
+  .wrap{max-width:1240px;margin:0 auto;padding:0 16px}
+  header.top{position:sticky;top:0;z-index:40;background:rgba(10,15,30,.9);
+    backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}
+  .top-inner{display:flex;align-items:center;gap:14px;padding:12px 0;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px}
+  .brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 12px var(--accent)}
+  .brand small{font-weight:500;color:var(--dim);font-size:11px;letter-spacing:.4px}
+  .top-spacer{flex:1}
+  .pills{display:flex;gap:8px;flex-wrap:wrap}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
+    background:var(--panel);border:1px solid var(--border);font-size:11.5px;color:var(--muted);white-space:nowrap}
+  .pill b{color:var(--text);font-weight:600}
+  .pill .led{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+  .pill.ok .led{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .pill.warn .led{background:var(--yellow);box-shadow:0 0 8px var(--yellow)}
+  .pill.bad .led{background:var(--red);box-shadow:0 0 8px var(--red)}
+
+  nav.tabs{display:flex;gap:4px;overflow-x:auto;padding:6px 0 10px;scrollbar-width:thin}
+  nav.tabs button{background:transparent;border:1px solid transparent;color:var(--muted);
+    padding:7px 14px;border-radius:999px;cursor:pointer;font-size:13px;font-family:inherit;white-space:nowrap}
+  nav.tabs button:hover{color:var(--text);background:var(--panel)}
+  nav.tabs button.active{background:var(--accent-soft);border-color:var(--accent);color:var(--text)}
+
+  main{padding-top:18px}
+  .view{display:none}
+  .view.active{display:block}
+  .grid{display:grid;gap:14px}
+  .g-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .g-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .g-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+  @media(max-width:1000px){.g-4{grid-template-columns:repeat(2,minmax(0,1fr))}.g-3{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media(max-width:720px){.g-2,.g-3,.g-4{grid-template-columns:1fr}}
+
+  .card{background:linear-gradient(180deg,var(--panel) 0%,var(--bg2) 100%);
+    border:1px solid var(--border);border-radius:var(--radius);padding:16px}
+  .card.tight{padding:12px}
+  .card-head{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+  .card-head h2{flex:1;min-width:140px}
+  .card-sub{color:var(--dim);font-size:11.5px}
+
+  .stat{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
+  .stat .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.7px}
+  .stat .v{font-size:26px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}
+  .stat .s{color:var(--dim);font-size:11.5px;margin-top:2px}
+
+  /* ---------- controls ---------- */
+  button.btn,a.btn{display:inline-flex;align-items:center;gap:7px;background:var(--panel2);
+    color:var(--text);border:1px solid var(--border2);padding:8px 13px;border-radius:var(--radius-sm);
+    cursor:pointer;font-size:12.5px;font-family:inherit;text-decoration:none;transition:.12s}
+  button.btn:hover,a.btn:hover{border-color:var(--accent);background:#1b2947}
+  button.btn.primary{background:linear-gradient(180deg,#3b7bf0,#2f66d4);border-color:#4f8cff}
+  button.btn.primary:hover{background:linear-gradient(180deg,#4f8cff,#3b7bf0)}
+  button.btn.danger{border-color:#5a2433;color:#ffb3bd}
+  button.btn.danger:hover{background:#3a1622;border-color:var(--red)}
+  button.btn.ghost{background:transparent}
+  button.btn:disabled{opacity:.45;cursor:not-allowed;border-color:var(--border)}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  label.field{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.5px}
+  input,select,textarea{background:var(--bg);border:1px solid var(--border2);color:var(--text);
+    border-radius:var(--radius-sm);padding:8px 10px;font-family:inherit;font-size:13px;outline:none}
+  input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+  input[type=checkbox]{width:auto;accent-color:var(--accent)}
+  .check{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);text-transform:none;letter-spacing:0}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .hint{color:var(--dim);font-size:11.5px}
+
+  /* ---------- tables ---------- */
+  .table-wrap{overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm);max-height:520px}
+  table{border-collapse:collapse;width:100%;font-size:12.5px}
+  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
+  th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-size:11px;
+    text-transform:uppercase;letter-spacing:.6px;z-index:1}
+  tbody tr:hover{background:rgba(79,140,255,.07)}
+  tbody tr.clickable{cursor:pointer}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  td.wrap{white-space:normal;max-width:420px;color:var(--muted)}
+  .empty{padding:26px;text-align:center;color:var(--dim)}
+
+  /* ---------- badges ---------- */
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;
+    border:1px solid transparent}
+  .b-normal{background:rgba(55,214,122,.14);color:var(--green);border-color:rgba(55,214,122,.35)}
+  .b-unusual{background:rgba(255,192,67,.14);color:var(--yellow);border-color:rgba(255,192,67,.35)}
+  .b-suspicious{background:rgba(255,92,114,.14);color:var(--red);border-color:rgba(255,92,114,.35)}
+  .b-anomaly{background:rgba(198,92,255,.16);color:var(--magenta);border-color:rgba(198,92,255,.4)}
+  .b-unscored,.b-live,.b-unknown{background:rgba(148,162,196,.12);color:var(--muted);border-color:var(--border2)}
+  .b-normal-l,.b-burst,.b-chain{font-size:10.5px}
+  .b-burst{background:rgba(255,92,114,.12);color:#ff9aa8;border-color:rgba(255,92,114,.3)}
+  .b-chain{background:rgba(198,92,255,.12);color:#d9a6ff;border-color:rgba(198,92,255,.3)}
+  .b-live{background:rgba(61,219,217,.12);color:var(--cyan);border-color:rgba(61,219,217,.3)}
+  .sev-high{color:var(--red);font-weight:700}
+  .sev-medium{color:var(--yellow);font-weight:700}
+
+  /* ---------- charts ---------- */
+  .bars-h{display:flex;flex-direction:column;gap:7px}
+  .bar-row{display:grid;grid-template-columns:120px 1fr 54px;gap:10px;align-items:center;font-size:12px}
+  .bar-label{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bar-track{height:9px;background:var(--track);border-radius:999px;overflow:hidden}
+  .bar-fill{display:block;height:100%;border-radius:999px;background:var(--accent);min-width:2px}
+  .bar-value{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+  @media(max-width:520px){.bar-row{grid-template-columns:84px 1fr 44px}}
+
+  .stack-chart{display:flex;gap:5px;align-items:flex-end;height:170px;padding-top:8px}
+  .stack-col{flex:1;display:flex;flex-direction:column;align-items:center;height:100%;gap:6px;min-width:0}
+  .stack-bar{flex:1;width:100%;display:flex;flex-direction:column-reverse;justify-content:flex-start;
+    background:var(--track);border-radius:5px;overflow:hidden;min-height:4px}
+  .stack-bar .seg{display:block;width:100%}
+  .stack-label{font-size:10px;color:var(--dim);white-space:nowrap}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin-top:10px}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+
+  .donut-wrap{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+  .donut circle{transition:stroke-dasharray .4s}
+  .donut-num{fill:var(--text);font-size:16px;font-weight:700;font-family:var(--sans)}
+  .donut-sub{fill:var(--dim);font-size:9px;letter-spacing:1px;text-transform:uppercase;font-family:var(--sans)}
+  .line-chart{width:100%;height:130px;display:block}
+  .line-axis{display:flex;justify-content:space-between;font-size:10.5px;color:var(--dim);margin-top:4px}
+
+  /* ---------- log / activity ---------- */
+  pre.log{background:#070b16;border:1px solid var(--border);border-radius:var(--radius-sm);
+    padding:12px;font-size:11.5px;line-height:1.5;max-height:420px;overflow:auto;white-space:pre-wrap;
+    word-break:break-word;margin:0;color:#c8d4ee}
+  pre.log .l-warn{color:var(--yellow)}
+  pre.log .l-err{color:var(--red)}
+  pre.log .l-ok{color:var(--green)}
+
+  #activity{position:fixed;left:0;right:0;bottom:0;z-index:60;background:rgba(9,13,25,.97);
+    border-top:1px solid var(--border2);backdrop-filter:blur(6px);max-height:46vh;display:flex;flex-direction:column}
+  #activity.hidden{display:none}
+  #activity .act-head{display:flex;align-items:center;gap:12px;padding:9px 16px;border-bottom:1px solid var(--border)}
+  #activity .act-body{overflow:auto;padding:10px 16px 16px}
+  .job-block{margin-bottom:12px;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}
+  .job-head{display:flex;align-items:center;gap:10px;padding:7px 11px;background:var(--panel);font-size:12px}
+  .job-head .spacer{flex:1}
+  .job-block pre{margin:0;border:0;border-radius:0;background:#070b16;max-height:230px}
+  .spin{width:11px;height:11px;border:2px solid var(--border2);border-top-color:var(--accent);
+    border-radius:50%;display:inline-block;animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .fab{position:fixed;right:16px;bottom:16px;z-index:55}
+
+  /* ---------- modal ---------- */
+  .modal{position:fixed;inset:0;z-index:80;background:rgba(4,7,14,.72);display:flex;
+    align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto}
+  .modal.hidden{display:none}
+  .modal-card{background:var(--panel);border:1px solid var(--border2);border-radius:var(--radius);
+    max-width:820px;width:100%;padding:20px}
+  .kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:12.5px}
+  .kv .k{color:var(--muted)}
+  .factor{display:grid;grid-template-columns:1fr 84px 92px;gap:10px;font-size:12px;padding:5px 0;
+    border-bottom:1px solid var(--border)}
+  .factor.bad{color:var(--yellow)}
+  .factor .p{text-align:right;font-variant-numeric:tabular-nums}
+  .factor .s{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+
+  #toasts{position:fixed;right:16px;top:70px;z-index:90;display:flex;flex-direction:column;gap:8px;max-width:340px}
+  .toast{padding:10px 13px;border-radius:var(--radius-sm);font-size:12.5px;border:1px solid var(--border2);
+    background:var(--panel2);box-shadow:0 8px 24px rgba(0,0,0,.4)}
+  .toast.ok{border-color:rgba(55,214,122,.5)} .toast.err{border-color:rgba(255,92,114,.55)}
+  .toast.info{border-color:rgba(79,140,255,.5)}
+  .muted{color:var(--muted)} .dim{color:var(--dim)}
+  .sep{height:1px;background:var(--border);margin:14px 0}
+  ul.clean{margin:0;padding-left:18px;color:var(--muted);font-size:12.5px}
+  ul.clean li{margin:3px 0}
+  details summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap top-inner">
+    <div class="brand">
+      <span class="dot"></span>
+      <div>Threat Detection Dashboard<br><small>behavior-based credential access monitoring</small></div>
+    </div>
+    <span class="top-spacer"></span>
+    <div class="pills" id="status-pills"></div>
+    <button class="btn ghost" id="refresh-btn" title="Reload all data">↻ Refresh</button>
+  </div>
+  <div class="wrap">
+    <nav class="tabs" id="tabs">
+      <button data-tab="overview" class="active">Overview</button>
+      <button data-tab="events">Events</button>
+      <button data-tab="detection">Detection</button>
+      <button data-tab="chains">Chains</button>
+      <button data-tab="baseline">Baseline</button>
+      <button data-tab="collector">Collector</button>
+      <button data-tab="alerts">Alerts</button>
+      <button data-tab="data">Data</button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ================= OVERVIEW ================= -->
+  <section class="view active" id="view-overview">
+    <div class="grid g-4" id="overview-stats"></div>
+
+    <div class="grid g-2" style="margin-top:14px">
+      <div class="card">
+        <div class="card-head"><h2>Risk score distribution</h2>
+          <span class="card-sub" id="scoring-note"></span></div>
+        <div id="hist-chart"></div>
+        <div class="legend">
+          <span><i style="background:var(--green)"></i>normal sessions</span>
+          <span><i style="background:var(--red)"></i>burst attacks</span>
+          <span><i style="background:var(--magenta)"></i>chain attacks</span>
+          <span><i style="background:var(--cyan)"></i>live / other</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Risk classification</h2></div>
+        <div class="donut-wrap">
+          <div id="level-donut"></div>
+          <div id="level-bars" style="flex:1;min-width:180px"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Events by credential store</h2></div>
+        <div id="artifact-chart"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Events by process</h2></div>
+        <div id="process-chart"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Collection timeline</h2>
+          <span class="card-sub">events per day (UTC)</span></div>
+        <div id="timeline-chart"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Access type / hour of day</h2></div>
+        <div id="access-chart"></div>
+        <div class="sep"></div>
+        <div id="hour-chart"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>Top flagged events</h2>
+        <span class="card-sub">click a row for the full probability breakdown</span></div>
+      <div id="top-flagged"></div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>System health</h2></div>
+      <div class="grid g-2">
+        <div id="health-list"></div>
+        <div id="health-policy"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= EVENTS ================= -->
+  <section class="view" id="view-events">
+    <div class="card">
+      <div class="card-head"><h2>Event explorer</h2>
+        <span class="card-sub" id="events-count"></span></div>
+      <div class="row">
+        <label class="field">Session
+          <select id="f-session">
+            <option value="">any</option>
+            <option value="normal_">normal_*</option>
+            <option value="attack_burst_">attack_burst_*</option>
+            <option value="attack_chain_">attack_chain_*</option>
+          </select></label>
+        <label class="field">Artifact<input id="f-artifact" placeholder="aws, .ssh, kube…"></label>
+        <label class="field">Access
+          <select id="f-access"><option value="">any</option>
+            <option>read</option><option>write</option><option>create</option>
+            <option>delete</option><option>moved</option></select></label>
+        <label class="field">Risk
+          <select id="f-risk"><option value="">any</option>
+            <option>normal</option><option>unusual</option><option>suspicious</option>
+            <option>anomaly</option><option>unscored</option></select></label>
+        <label class="field">Search path / process / user<input id="f-q" placeholder="id_rsa"></label>
+        <label class="field">Order<select id="f-order"><option value="newest">newest first</option>
+          <option value="oldest">oldest first</option></select></label>
+        <label class="field">Per page<select id="f-limit">
+          <option>25</option><option selected>50</option><option>100</option><option>250</option></select></label>
+        <button class="btn primary" id="events-apply">Apply</button>
+        <button class="btn ghost" id="events-reset">Reset</button>
+        <button class="btn" id="events-export-csv" title="Download every matching event as CSV">Export CSV</button>
+        <button class="btn" id="events-export-json" title="Download every matching event as JSON">Export JSON</button>
+      </div>
+      <p class="hint">Exports honor the filters above and are not limited to the current page.</p>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div id="events-table"></div>
+      <div class="controls" style="margin-top:12px;justify-content:space-between">
+        <span class="hint" id="events-page-note"></span>
+        <span class="controls">
+          <button class="btn" id="events-prev">← Prev</button>
+          <button class="btn" id="events-next">Next →</button>
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= DETECTION ================= -->
+  <section class="view" id="view-detection">
+    <div class="grid g-2">
+      <div class="card">
+        <div class="card-head"><h2>Bayesian Network model</h2>
+          <span class="card-sub" id="model-state"></span></div>
+        <div id="model-info"></div>
+        <div class="sep"></div>
+        <div class="controls">
+          <button class="btn primary" data-run="train">Train model</button>
+          <button class="btn" data-run="score">Score all events</button>
+          <label class="check"><input type="checkbox" id="score-report" checked> write alerts.json</label>
+          <button class="btn" data-run="evaluate">Evaluate both layers</button>
+        </div>
+        <p class="hint">Training learns conditional probabilities from <b>normal_*</b> sessions only;
+        attack sessions stay held out for evaluation.</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Evaluation</h2>
+          <span class="card-sub" id="eval-note">run it to see live numbers</span></div>
+        <div id="eval-body"><div class="empty">No evaluation in this session yet.</div></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>Detection thresholds &amp; weights</h2></div>
+      <div id="thresholds"></div>
+    </div>
+  </section>
+
+  <!-- ================= CHAINS ================= -->
+  <section class="view" id="view-chains">
+    <div class="grid g-3" id="chain-stats"></div>
+    <div class="grid g-2" style="margin-top:14px">
+      <div class="card">
+        <div class="card-head"><h2>Sequence layer</h2>
+          <span class="card-sub">order-aware chain rules (sequences.py)</span></div>
+        <div id="chain-rules"></div>
+        <div class="sep"></div>
+        <div class="controls">
+          <button class="btn primary" data-run="chains">Scan sessions</button>
+          <label class="check"><input type="checkbox" id="chains-report" checked> write chains.json</label>
+          <button class="btn" id="chains-export-csv">Export CSV</button>
+          <button class="btn" id="chains-export-json">Export JSON</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Chain evaluation</h2>
+          <span class="card-sub">recall on labeled chains, false positives on normal</span></div>
+        <div id="chain-eval"></div>
+        <div class="sep"></div>
+        <div id="chain-tunables"></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>Detected chains</h2><span class="card-sub" id="chain-count"></span></div>
+      <div id="chain-table"></div>
+    </div>
+  </section>
+
+  <!-- ================= BASELINE ================= -->
+  <section class="view" id="view-baseline">
+    <div class="card">
+      <div class="card-head"><h2>Behavior profiles</h2>
+        <span class="card-sub">one profile per (artifact, user, process) triple</span></div>
+      <div class="controls">
+        <button class="btn primary" data-run="baseline">Compute baseline</button>
+        <label class="check"><input type="checkbox" id="baseline-reset" checked> reset first</label>
+        <button class="btn ghost" id="baseline-reload">Reload view</button>
+        <button class="btn" id="baseline-export-csv">Export CSV</button>
+      </div>
+      <div class="grid g-4" style="margin-top:14px" id="baseline-stats"></div>
+      <div class="grid g-2" style="margin-top:14px">
+        <div><h3>Profiles per artifact</h3><div id="baseline-artifacts"></div></div>
+        <div><h3>Profiles per process</h3><div id="baseline-processes"></div></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>Profile table</h2><span class="card-sub" id="baseline-note"></span></div>
+      <div id="baseline-table"></div>
+    </div>
+  </section>
+
+  <!-- ================= COLLECTOR ================= -->
+  <section class="view" id="view-collector">
+    <div class="grid g-2">
+      <div class="card">
+        <div class="card-head"><h2>Live collector</h2><span class="card-sub" id="collector-state"></span></div>
+        <div id="collector-info"></div>
+        <div class="sep"></div>
+        <div class="controls">
+          <button class="btn primary" id="collector-start">Start collector</button>
+          <button class="btn danger" id="collector-stop">Stop collector</button>
+          <span class="hint">SIGINT first so audit rules are removed on exit.</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Monitored paths</h2><span class="card-sub">policy_v2.yaml</span></div>
+        <div id="policy-body"></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>Live demo</h2>
+        <span class="card-sub">demo.sh — benign access, chain, credential sweep</span></div>
+      <div class="controls">
+        <button class="btn primary" id="demo-fast">Run demo (fast, ~40s)</button>
+        <button class="btn" id="demo-full">Run demo (full pacing)</button>
+        <label class="check"><input type="checkbox" id="demo-metrics"> print batch metrics first</label>
+      </div>
+      <p class="hint">Starts its own collector (<span class="mono">demo.sh --self</span>), only touches scratch
+      files inside <span class="mono">~/.azure</span>, and cleans up afterwards. Output streams to the activity log.
+      Nothing here is sent to the network.</p>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>Collector log</h2>
+        <span class="card-sub" id="collector-log-note"></span>
+        <label class="check"><input type="checkbox" id="collector-autorefresh" checked> auto-refresh</label>
+        <button class="btn ghost" id="collector-log-refresh">Refresh now</button>
+      </div>
+      <pre class="log" id="collector-log">No collector log yet.</pre>
+    </div>
+  </section>
+
+  <!-- ================= ALERTS ================= -->
+  <section class="view" id="view-alerts">
+    <div class="grid g-2">
+      <div class="card">
+        <div class="card-head"><h2>Alert sinks</h2><span class="card-sub">alerts.py — policy + env config</span></div>
+        <div id="sinks-body"></div>
+        <div class="sep"></div>
+        <div class="controls">
+          <button class="btn" id="alerts-test">Run sink self-test</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>alerts.json report</h2><span class="card-sub" id="alerts-report-note"></span></div>
+        <div id="alerts-summary"></div>
+        <div class="controls" style="margin-top:10px">
+          <button class="btn" id="alerts-download">Download alerts.json</button>
+          <button class="btn" id="chains-download">Download chains.json</button>
+          <button class="btn" id="alerts-export-csv">Export alerts CSV</button>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>Alerts in report</h2><span class="card-sub" id="alerts-count"></span></div>
+      <div id="alerts-table"></div>
+    </div>
+  </section>
+
+  <!-- ================= DATA ================= -->
+  <section class="view" id="view-data">
+    <div class="grid g-2">
+      <div class="card">
+        <div class="card-head"><h2>Generate labeled dataset</h2></div>
+        <p class="hint">Runs the project's seeded generator (ml/generate_test_events.py):
+        400 normal + 180 burst attack + 80 chain attack events. Same seed → same dataset.</p>
+        <div class="row">
+          <label class="field">Seed<input id="gen-seed" type="number" value="42" min="0"></label>
+          <label class="check"><input type="checkbox" id="gen-clear" checked> clear events + baseline first</label>
+          <button class="btn primary" id="gen-run">Generate</button>
+        </div>
+        <div class="sep"></div>
+        <h3>Full pipeline</h3>
+        <p class="hint">Generate → baseline → train → score (+alerts.json) → evaluate → chain scan.
+        Equivalent to <span class="mono">./run_all.sh --skip-live</span> without the live smoke test.</p>
+        <div class="controls">
+          <button class="btn primary" id="pipeline-run">Rebuild everything</button>
+          <span class="hint">uses the seed above</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Analyze uploaded events</h2></div>
+        <p class="hint">Import recorded events (CSV or JSON) into the same SQLite table the collector
+        writes to, then score them with the existing model. Recognised columns:
+        <span class="mono">timestamp, artifact_path, access_type, pid, process_name, ppid,
+        parent_process_name, user_id, username, time_delta, session_id, files_in_session</span>.</p>
+        <div class="row">
+          <input type="file" id="upload-file" accept=".csv,.json,.txt">
+          <label class="check"><input type="checkbox" id="upload-analyze" checked> run baseline + score + evaluate after import</label>
+          <button class="btn primary" id="upload-run">Upload &amp; import</button>
+        </div>
+        <div id="upload-result" style="margin-top:12px"></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>Run the CLIs</h2>
+        <span class="card-sub">every dashboard action maps to one of these commands</span></div>
+      <div id="cli-map"></div>
+      <div class="sep"></div>
+      <h3>Danger zone</h3>
+      <div class="controls">
+        <button class="btn danger" id="db-clear">Clear events + baseline</button>
+        <span class="hint">Deletes all rows from <span class="mono">collector.db</span>; the schema and the
+        trained model are kept.</span>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<div id="activity" class="hidden">
+  <div class="act-head">
+    <b>Activity</b><span class="hint" id="act-note">no jobs run yet</span>
+    <span class="top-spacer" style="flex:1"></span>
+    <button class="btn ghost" id="act-clear">Clear finished</button>
+    <button class="btn ghost" id="act-close">Hide</button>
+  </div>
+  <div class="act-body" id="act-body"></div>
+</div>
+<button class="btn fab hidden" id="act-open">Activity</button>
+
+<div id="toasts"></div>
+
+<div class="modal hidden" id="modal">
+  <div class="modal-card">
+    <div class="card-head">
+      <h2 id="modal-title">Event</h2>
+      <span class="top-spacer" style="flex:1"></span>
+      <button class="btn ghost" id="modal-close">Close</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ------------------------------------------------------------------ */
+/* helpers                                                             */
+/* ------------------------------------------------------------------ */
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => String(s === null || s === undefined ? "" : s)
+  .replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = n => (n === null || n === undefined) ? "–" : Number(n).toLocaleString();
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function fmtTime(ts) {
+  if (!ts) return "–";
+  const d = new Date(ts);
+  if (isNaN(d)) return String(ts);
+  const p = n => String(n).padStart(2, "0");
+  return `${p(d.getUTCDate())} ${MONTHS[d.getUTCMonth()]} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}Z`;
+}
+function bytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB"]; let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+async function api(path, options) {
+  const res = await fetch(path, options);
+  let data = {};
+  try { data = await res.json(); } catch (e) { data = {}; }
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+function toast(msg, kind = "info", ms = 5200) {
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.textContent = msg;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+function badge(level) {
+  const l = (level || "unscored").toLowerCase();
+  return `<span class="badge b-${esc(l)}">${esc(l)}</span>`;
+}
+function labelBadge(label) {
+  return `<span class="badge b-normal-l b-${esc(label)}">${esc(label)}</span>`;
+}
+function empty(msg) { return `<div class="empty">${esc(msg)}</div>`; }
+
+/* ------------- chart primitives (CSS + SVG, no dependencies) ------- */
+function barsH(items, opts = {}) {
+  if (!items || !items.length) return empty("No data");
+  const max = Math.max(1, ...items.map(i => i.value || 0));
+  return `<div class="bars-h">` + items.map(i => `
+    <div class="bar-row">
+      <span class="bar-label" title="${esc(i.label)}">${esc(i.label)}</span>
+      <span class="bar-track"><span class="bar-fill" style="width:${((i.value || 0) / max * 100).toFixed(1)}%;background:${i.color || opts.color || "var(--accent)"}"></span></span>
+      <span class="bar-value">${fmt(i.value)}</span>
+    </div>`).join("") + `</div>`;
+}
+function stackedBars(items, keys, colors) {
+  if (!items || !items.length) return empty("No data");
+  const max = Math.max(1, ...items.map(i => keys.reduce((s, k) => s + (i[k] || 0), 0)));
+  return `<div class="stack-chart">` + items.map(i => {
+    const segs = keys.map(k => (i[k] || 0)
+      ? `<span class="seg" style="height:${((i[k] || 0) / max * 100).toFixed(1)}%;background:${colors[k]}" title="${esc(k)}: ${i[k]}"></span>`
+      : "").join("");
+    return `<div class="stack-col"><div class="stack-bar" title="${esc(i.range)}: ${keys.map(k => k + " " + (i[k] || 0)).join(", ")}">${segs}</div>
+      <span class="stack-label">${esc(i.range)}</span></div>`;
+  }).join("") + `</div>`;
+}
+function donut(segments, opts = {}) {
+  const size = opts.size || 148, th = 20, r = (size - th) / 2, c = 2 * Math.PI * r;
+  const total = segments.reduce((s, x) => s + x.value, 0);
+  let off = 0;
+  const arcs = segments.filter(s => s.value > 0).map(s => {
+    const len = s.value / (total || 1) * c;
+    const el = `<circle r="${r}" cx="${size / 2}" cy="${size / 2}" fill="none" stroke="${s.color}"
+      stroke-width="${th}" stroke-dasharray="${len} ${c - len}" stroke-dashoffset="${-off}"
+      transform="rotate(-90 ${size / 2} ${size / 2})"><title>${esc(s.label)}: ${s.value}</title></circle>`;
+    off += len; return el;
+  }).join("");
+  return `<svg class="donut" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" role="img">
+    <circle r="${r}" cx="${size / 2}" cy="${size / 2}" fill="none" stroke="var(--track)" stroke-width="${th}"/>
+    ${arcs}
+    <text x="50%" y="47%" text-anchor="middle" class="donut-num">${fmt(total)}</text>
+    <text x="50%" y="62%" text-anchor="middle" class="donut-sub">${esc(opts.caption || "events")}</text>
+  </svg>`;
+}
+function lineChart(points) {
+  if (!points || points.length < 1) return empty("No timeline data");
+  const w = 600, h = 130, pad = 6;
+  const max = Math.max(1, ...points.map(p => p.value));
+  const step = points.length > 1 ? (w - 2 * pad) / (points.length - 1) : 0;
+  const xy = points.map((p, i) => [pad + i * step, h - pad - (p.value / max) * (h - 2 * pad)]);
+  const d = xy.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`).join(" ");
+  const area = `${d} L ${xy[xy.length - 1][0].toFixed(1)} ${h - pad} L ${xy[0][0].toFixed(1)} ${h - pad} Z`;
+  return `<svg class="line-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      <path d="${area}" fill="var(--accent-soft)"/>
+      <path d="${d}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/>
+    </svg>
+    <div class="line-axis"><span>${esc(points[0].label)}</span>
+      <span>peak ${fmt(max)} / day</span>
+      <span>${esc(points[points.length - 1].label)}</span></div>`;
+}
+function kvCard(rows) {
+  return `<div class="kv">` + rows.filter(r => r).map(r =>
+    `<span class="k">${esc(r[0])}</span><span>${r[1]}</span>`).join("") + `</div>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* state                                                               */
+/* ------------------------------------------------------------------ */
+const state = {
+  tab: "overview",
+  overview: null,
+  stats: null,
+  events: { offset: 0, limit: 50, total: 0, last: null },
+  jobs: {},            // id -> {label, status, output}
+  jobOrder: [],
+  evaluation: null,
+  chains: null,
+  alerts: null,
+  collectorTimer: null,
+};
+
+/* ------------------------------------------------------------------ */
+/* job runner + activity drawer                                        */
+/* ------------------------------------------------------------------ */
+function openActivity() { $("#activity").classList.remove("hidden"); $("#act-open").classList.add("hidden"); }
+function closeActivity() { $("#activity").classList.add("hidden"); $("#act-open").classList.remove("hidden"); }
+function renderActivity() {
+  const body = $("#act-body");
+  if (!state.jobOrder.length) { body.innerHTML = empty("No jobs run yet in this session."); $("#act-note").textContent = "no jobs run yet"; return; }
+  body.innerHTML = state.jobOrder.map(id => {
+    const j = state.jobs[id];
+    const running = j.status === "running";
+    const cls = j.status === "error" ? "l-err" : (j.status === "done" ? "l-ok" : "");
+    return `<div class="job-block">
+      <div class="job-head">
+        ${running ? '<span class="spin"></span>' : ""}
+        <b>${esc(j.label)}</b>
+        <span class="badge ${j.status === "error" ? "b-suspicious" : (j.status === "done" ? "b-normal" : "b-unscored")}">${esc(j.status)}</span>
+        <span class="spacer"></span>
+        <span class="hint">${j.duration ? j.duration.toFixed(1) + "s" : ""}</span>
+      </div>
+      <pre class="log ${cls}">${esc((j.output || []).join("\n")) || "…"}</pre>
+    </div>`;
+  }).join("");
+  body.scrollTop = body.scrollHeight;
+  const running = Object.values(state.jobs).filter(j => j.status === "running").length;
+  $("#act-note").textContent = running ? `${running} running` : `${state.jobOrder.length} job(s)`;
+}
+async function runJob(path, body, label, onDone) {
+  try {
+    const res = await api(path, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    if (res.job) {
+      await pollJob(res.job.id, label, onDone);
+    } else {
+      toast(label + " — done", "ok");
+      if (onDone) onDone(res);
+    }
+  } catch (e) {
+    toast(`${label} failed: ${e.message}`, "err", 9000);
+  }
+}
+async function pollJob(id, label, onDone) {
+  if (!state.jobs[id]) { state.jobs[id] = { label, status: "running", output: [] }; state.jobOrder.push(id); }
+  openActivity(); renderActivity();
+  for (;;) {
+    let j;
+    try { j = await api("/api/job?id=" + encodeURIComponent(id)); }
+    catch (e) { toast("Lost track of job " + id, "err"); return; }
+    const rec = state.jobs[id];
+    rec.status = j.status; rec.output = j.output || []; rec.duration = j.duration;
+    renderActivity();
+    if (j.status === "done" || j.status === "error") {
+      if (j.status === "error") toast(`${label} failed: ${j.error || "see activity log"}`, "err", 9000);
+      else toast(`${label} — complete`, "ok");
+      if (onDone) await onDone(j.result);
+      return j;
+    }
+    await sleep(600);
+  }
+}
+async function reloadAfterJob() {
+  await Promise.all([loadOverview(), loadStats()]);
+  if (state.tab === "events") loadEvents();
+  if (state.tab === "chains") loadChains();
+  if (state.tab === "baseline") loadBaseline();
+  if (state.tab === "alerts") loadAlerts();
+  if (state.tab === "detection") loadModel();
+  if (state.tab === "collector") loadCollector();
+}
+
+/* ------------------------------------------------------------------ */
+/* tabs                                                                */
+/* ------------------------------------------------------------------ */
+function showTab(tab) {
+  state.tab = tab;
+  if (location.hash.slice(1) !== tab) history.replaceState(null, "", "#" + tab);
+  $$("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + tab));
+  if (tab === "overview") { loadOverview(); loadStats(); }
+  if (tab === "events") loadEvents();
+  if (tab === "detection") loadModel();
+  if (tab === "chains") loadChains();
+  if (tab === "baseline") loadBaseline();
+  if (tab === "collector") loadCollector();
+  if (tab === "alerts") loadAlerts();
+}
+$("#tabs").addEventListener("click", e => {
+  const b = e.target.closest("button[data-tab]");
+  if (b) showTab(b.dataset.tab);
+});
+
+/* ------------------------------------------------------------------ */
+/* overview + stats                                                    */
+/* ------------------------------------------------------------------ */
+async function loadOverview() {
+  try {
+    const d = await api("/api/overview");
+    state.overview = d;
+    renderPills(d);
+    renderOverviewStats(d);
+    renderHealth(d);
+  } catch (e) { toast("Overview failed: " + e.message, "err"); }
+}
+function renderPills(d) {
+  const pills = [];
+  pills.push(`<span class="pill ${d.model.trained ? "ok" : "bad"}"><span class="led"></span>model <b>${d.model.trained ? "trained" : "untrained"}</b></span>`);
+  pills.push(`<span class="pill ${d.collector.running ? "ok" : ""}"><span class="led"></span>collector <b>${d.collector.running ? "running" : "stopped"}</b></span>`);
+  pills.push(`<span class="pill"><span class="led"></span>events <b>${fmt(d.db.events)}</b></span>`);
+  pills.push(`<span class="pill"><span class="led"></span>profiles <b>${fmt(d.db.baseline_profiles)}</b></span>`);
+  const worst = (d.risk_levels && (d.risk_levels.anomaly || d.risk_levels.suspicious)) ? "bad" : "ok";
+  pills.push(`<span class="pill ${worst}"><span class="led"></span>flagged <b>${fmt((d.risk_levels.suspicious || 0) + (d.risk_levels.anomaly || 0) + (d.risk_levels.unusual || 0))}</b></span>`);
+  $("#status-pills").innerHTML = pills.join("");
+}
+function renderOverviewStats(d) {
+  const risks = d.risk_levels || {};
+  const flagged = (risks.unusual || 0) + (risks.suspicious || 0) + (risks.anomaly || 0);
+  const cards = [
+    ["Events collected", fmt(d.db.events), `${fmt(d.db.sessions)} sessions`],
+    ["Baseline profiles", fmt(d.db.baseline_profiles), "artifact × user × process"],
+    ["Flagged events", fmt(flagged), d.scoring.trained ? `${fmt(d.scoring.scored)} scored` : "model not trained"],
+    ["Alert report", d.alerts.report && d.alerts.report.present ? fmt(d.alerts.alert_count) : "–",
+      d.alerts.report && d.alerts.report.present ? "alerts.json present" : "run score-all --report"],
+  ];
+  $("#overview-stats").innerHTML = cards.map(c => `<div class="stat">
+      <div class="k">${esc(c[0])}</div><div class="v">${esc(c[1])}</div><div class="s">${esc(c[2])}</div></div>`).join("");
+}
+function renderHealth(d) {
+  const deps = Object.entries(d.deps || {}).map(([k, v]) =>
+    `<span class="badge ${v ? "b-normal" : "b-suspicious"}">${esc(k)} ${v ? "ok" : "missing"}</span>`).join(" ");
+  const tools = `<span class="badge ${d.tools.auditctl ? "b-normal" : "b-unusual"}">auditctl ${d.tools.auditctl ? "present" : "absent"}</span>
+    <span class="badge ${d.tools.ausearch ? "b-normal" : "b-unusual"}">ausearch ${d.tools.ausearch ? "present" : "absent"}</span>`;
+  $("#health-list").innerHTML = kvCard([
+    ["Project root", `<span class="mono">${esc(d.project_root)}</span>`],
+    ["Database", `<span class="mono">${esc(d.db.path)}</span> (${bytes(d.db.size)})`],
+    ["Event window", `${esc(fmtTime(d.db.first_event))} → ${esc(fmtTime(d.db.last_event))}`],
+    ["Python", esc(d.python)],
+    ["Dependencies", deps],
+    ["Audit tooling", tools],
+    ["Scored at", esc(d.scoring.scored_at ? fmtTime(d.scoring.scored_at) : "–")],
+  ]);
+  const missing = d.policy.missing || [];
+  $("#health-policy").innerHTML = `<h3>Monitored paths (${(d.policy.targets || []).length})</h3>` +
+    ((d.policy.targets || []).length
+      ? `<ul class="clean">` + d.policy.targets.map(t =>
+          `<li><span class="mono">${esc(t.path)}</span> — ${esc(t.category || "")}
+           ${t.exists ? '<span class="badge b-normal">exists</span>' : '<span class="badge b-unusual">missing</span>'}</li>`).join("") + `</ul>`
+      : empty("No monitoring targets in policy_v2.yaml")) +
+    (missing.length ? `<p class="hint">⚠ ${missing.length} path(s) missing — the collector skips them.</p>` : "");
+}
+async function loadStats() {
+  try {
+    const s = await api("/api/stats");
+    state.stats = s;
+    $("#scoring-note").textContent = s.score_status.trained
+      ? `${fmt(s.score_status.scored)} events scored · risk ${s.score_status.min}–${s.score_status.max}`
+      : "model not trained — no scores yet";
+    const keys = ["normal", "burst", "chain", "live"];
+    const colors = { normal: "var(--green)", burst: "var(--red)", chain: "var(--magenta)", live: "var(--cyan)" };
+    $("#hist-chart").innerHTML = stackedBars(s.histogram, keys, colors);
+    const lv = s.risk_levels || {};
+    $("#level-donut").innerHTML = donut([
+      { label: "normal", value: lv.normal || 0, color: "var(--green)" },
+      { label: "unusual", value: lv.unusual || 0, color: "var(--yellow)" },
+      { label: "suspicious", value: lv.suspicious || 0, color: "var(--red)" },
+      { label: "anomaly", value: lv.anomaly || 0, color: "var(--magenta)" },
+    ], { caption: "scored" });
+    $("#level-bars").innerHTML = barsH(["normal", "unusual", "suspicious", "anomaly"].map(k => ({
+      label: k, value: lv[k] || 0,
+      color: { normal: "var(--green)", unusual: "var(--yellow)", suspicious: "var(--red)", anomaly: "var(--magenta)" }[k],
+    })));
+    $("#artifact-chart").innerHTML = s.by_artifact.length
+      ? barsH(s.by_artifact.map(a => ({ label: a.artifact, value: a.total, color: "var(--accent)" }))) +
+        (s.by_artifact.some(a => a.flagged)
+          ? `<div class="legend"><span><i style="background:var(--red)"></i>flagged: ` +
+            s.by_artifact.filter(a => a.flagged).map(a => `${esc(a.artifact)} ${a.flagged}`).join(" · ") + `</span></div>`
+          : "")
+      : empty("No events");
+    $("#process-chart").innerHTML = barsH(s.by_process.map(p => ({ label: p.process, value: p.count })));
+    const tl = s.timeline.slice(-40).map(p => ({ label: p.date.slice(5), value: p.count }));
+    $("#timeline-chart").innerHTML = lineChart(tl);
+    $("#access-chart").innerHTML = barsH(s.by_access_type.map(a => ({ label: a.access_type, value: a.count, color: "var(--cyan)" })));
+    const hours = s.by_hour.filter(h => h.count > 0);
+    $("#hour-chart").innerHTML = hours.length
+      ? `<h3 style="margin-bottom:8px">Hour of day (UTC)</h3>` + barsH(hours.map(h => ({ label: String(h.hour).padStart(2, "0") + ":00", value: h.count, color: "var(--magenta)" })))
+      : "";
+    renderTopFlagged(s.top_flagged);
+  } catch (e) { toast("Stats failed: " + e.message, "err"); }
+}
+function renderTopFlagged(rows) {
+  if (!rows || !rows.length) { $("#top-flagged").innerHTML = empty(state.overview && state.overview.model.trained ? "No flagged events." : "Train the model to score events."); return; }
+  $("#top-flagged").innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th>Event</th><th>Risk</th><th>Level</th><th>Artifact</th><th>Process</th><th>Session</th><th>Label</th><th>Time</th></tr></thead>
+    <tbody>` + rows.map(r => `<tr class="clickable" data-event="${r.event_id}">
+      <td class="mono">#${r.event_id}</td>
+      <td class="num">${r.risk_score}</td>
+      <td>${badge(r.risk_level)}</td>
+      <td>${esc(r.artifact || "–")}</td><td>${esc(r.process || "–")}</td>
+      <td class="mono">${esc(r.session_id || "–")}</td>
+      <td>${labelBadge(r.label)}</td>
+      <td class="mono">${esc(fmtTime(r.timestamp))}</td></tr>`).join("") + `</tbody></table></div>`;
+  bindEventRows();
+}
+
+/* ------------------------------------------------------------------ */
+/* events                                                              */
+/* ------------------------------------------------------------------ */
+function eventFilters() {
+  return {
+    session: $("#f-session").value, artifact: $("#f-artifact").value.trim(),
+    access_type: $("#f-access").value, risk_level: $("#f-risk").value,
+    q: $("#f-q").value.trim(), order: $("#f-order").value,
+    limit: Number($("#f-limit").value) || 50,
+  };
+}
+async function loadEvents(resetOffset) {
+  if (resetOffset) state.events.offset = 0;
+  const f = eventFilters();
+  const p = new URLSearchParams({ ...f, offset: String(state.events.offset), limit: String(f.limit) });
+  try {
+    const d = await api("/api/events?" + p.toString());
+    state.events.total = d.total; state.events.limit = d.limit;
+    $("#events-count").textContent = `${fmt(d.total)} matching event(s)`;
+    $("#events-page-note").textContent = d.total
+      ? `showing ${d.offset + 1}–${Math.min(d.offset + d.events.length, d.total)} of ${fmt(d.total)}`
+      : "";
+    if (!d.events.length) { $("#events-table").innerHTML = empty("No events match these filters."); return; }
+    $("#events-table").innerHTML = `<div class="table-wrap"><table>
+      <thead><tr><th>Event</th><th>Time</th><th>Label</th><th>Artifact path</th><th>Access</th>
+      <th>Process</th><th>User</th><th>Session</th><th>Δ t</th><th>Files</th><th>Risk</th><th>Level</th></tr></thead>
+      <tbody>` + d.events.map(e => `<tr class="clickable" data-event="${e.id}">
+        <td class="mono">#${e.id}</td>
+        <td class="mono">${esc(fmtTime(e.timestamp))}</td>
+        <td>${labelBadge(e.label)}</td>
+        <td class="mono" title="${esc(e.artifact_path)}">${esc(e.artifact_path)}</td>
+        <td>${esc(e.access_type)}</td>
+        <td>${esc(e.process_name || "–")}</td>
+        <td>${esc(e.username || e.user_id || "–")}</td>
+        <td class="mono">${esc(e.session_id || "–")}</td>
+        <td class="num">${e.time_delta === null || e.time_delta === undefined ? "–" : Number(e.time_delta).toFixed(2)}</td>
+        <td class="num">${e.files_in_session === null || e.files_in_session === undefined ? "–" : e.files_in_session}</td>
+        <td class="num">${e.risk_score === null ? "–" : e.risk_score}</td>
+        <td>${badge(e.risk_level)}</td></tr>`).join("") + `</tbody></table></div>`;
+    bindEventRows();
+  } catch (e) { toast("Events failed: " + e.message, "err"); }
+}
+function bindEventRows() {
+  $$("tr[data-event]").forEach(tr => tr.addEventListener("click", () => showEvent(tr.dataset.event)));
+}
+async function showEvent(id) {
+  $("#modal").classList.remove("hidden");
+  $("#modal-title").textContent = "Event #" + id;
+  $("#modal-body").innerHTML = `<div class="empty">Scoring event…</div>`;
+  try {
+    const d = await api("/api/event?id=" + encodeURIComponent(id));
+    const e = d.event, s = d.score;
+    const factors = (s.factors || []).map(f => `<div class="factor ${f.normal ? "" : "bad"}">
+        <span class="mono">P(${esc(f.variable)}${f.parent ? " | " + esc(f.parent) : ""})</span>
+        <span class="p">${Number(f.probability).toFixed(5)}</span>
+        <span class="s">surprise ${Number(f.surprise || 0).toFixed(2)}${f.weight && f.weight !== 1 ? " ×" + f.weight : ""}</span>
+      </div>`).join("");
+    const feats = Object.entries(s.features || {}).map(([k, v]) =>
+      `<span class="badge b-unscored">${esc(k)}=${esc(v)}</span>`).join(" ");
+    $("#modal-body").innerHTML = `
+      <div class="grid g-2">
+        <div>${kvCard([
+          ["Risk", `${badge(s.risk_level)} <b>${Number(s.risk_score).toFixed(1)}</b>/100`],
+          ["Weighted surprise", Number(s.weighted_surprise || 0).toFixed(3)],
+          ["Driving factor", esc(s.worst_factor || "–")],
+          ["Dataset label", labelBadge(d.label)],
+        ])}</div>
+        <div>${kvCard([
+          ["Timestamp", esc(fmtTime(e.timestamp))],
+          ["Path", `<span class="mono">${esc(e.artifact_path)}</span>`],
+          ["Access / process", `${esc(e.access_type)} · ${esc(e.process_name || "–")}`],
+          ["User / session", `${esc(e.username || "–")} · <span class="mono">${esc(e.session_id || "–")}</span>`],
+        ])}</div>
+      </div>
+      <div class="sep"></div>
+      <h3>Features</h3><div class="controls" style="margin-top:6px">${feats}</div>
+      <div class="sep"></div>
+      <h3>Conditional probabilities</h3>
+      <div style="margin-top:6px">${factors || empty("No factors (model not trained)")}</div>
+      <div class="sep"></div>
+      <h3>Explanation</h3><p class="mono" style="color:var(--muted);font-size:12px">${esc(s.explanation || "")}</p>`;
+  } catch (e) {
+    $("#modal-body").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+$("#modal-close").addEventListener("click", () => $("#modal").classList.add("hidden"));
+$("#modal").addEventListener("click", e => { if (e.target === $("#modal")) $("#modal").classList.add("hidden"); });
+["events-apply"].forEach(id => $("#" + id).addEventListener("click", () => loadEvents(true)));
+$("#events-reset").addEventListener("click", () => {
+  ["f-artifact", "f-q"].forEach(i => $("#" + i).value = "");
+  ["f-session", "f-access", "f-risk", "f-order"].forEach(i => $("#" + i).value = "");
+  $("#f-limit").value = "50"; loadEvents(true);
+});
+$("#events-prev").addEventListener("click", () => { state.events.offset = Math.max(0, state.events.offset - state.events.limit); loadEvents(); });
+$("#events-next").addEventListener("click", () => {
+  if (state.events.offset + state.events.limit < state.events.total) { state.events.offset += state.events.limit; loadEvents(); }
+});
+$("#f-q").addEventListener("keydown", e => { if (e.key === "Enter") loadEvents(true); });
+
+/* Exports are plain GET downloads: the server applies the same filters the
+   view used, so the file always matches the table on screen. */
+function exportView(dataset, fmt) {
+  const params = new URLSearchParams({ dataset, format: fmt });
+  if (dataset === "events") {
+    const f = eventFilters();
+    ["session", "artifact", "access_type", "risk_level", "q", "order"]
+      .forEach(k => params.set(k, f[k]));
+  }
+  toast(`Exporting ${dataset} as ${fmt.toUpperCase()}…`, "info", 2500);
+  window.location.assign("/api/export?" + params.toString());
+}
+$("#events-export-csv").addEventListener("click", () => exportView("events", "csv"));
+$("#events-export-json").addEventListener("click", () => exportView("events", "json"));
+$("#baseline-export-csv").addEventListener("click", () => exportView("baseline", "csv"));
+$("#chains-export-csv").addEventListener("click", () => exportView("chains", "csv"));
+$("#chains-export-json").addEventListener("click", () => exportView("chains", "json"));
+$("#alerts-export-csv").addEventListener("click", () => exportView("alerts", "csv"));
+
+/* ------------------------------------------------------------------ */
+/* detection                                                           */
+/* ------------------------------------------------------------------ */
+async function loadModel() {
+  try {
+    const m = await api("/api/model");
+    $("#model-state").textContent = m.trained ? "trained" : "not trained";
+    $("#model-info").innerHTML = kvCard([
+      ["Status", m.trained ? '<span class="badge b-normal">trained</span>' : '<span class="badge b-suspicious">untrained</span>'],
+      ["Model file", `<span class="mono">${esc(m.path)}</span> (${bytes(m.size)})`],
+      ["Saved", esc(m.mtime ? fmtTime(m.mtime) : "–")],
+      ["Nodes", `${m.nodes.length} — <span class="mono">${esc(m.nodes.join(", "))}</span>`],
+      ["Edges", `${m.edges.length} — <span class="mono">${esc(m.edges.map(e => e[0] + "→" + e[1]).join(", "))}</span>`],
+      ["Artifact states", esc((m.states.artifact || []).join(", "))],
+    ]);
+    $("#thresholds").innerHTML = `<div class="grid g-2">
+      <div>${kvCard([
+        ["ANOMALY ≥", m.thresholds.anomaly], ["SUSPICIOUS ≥", m.thresholds.suspicious],
+        ["UNUSUAL ≥", m.thresholds.unusual],
+      ])}</div>
+      <div>${kvCard([
+        ["Surprise floor", m.surprise.floor], ["Surprise ceiling", m.surprise.ceil],
+        ["Factor weights", `<span class="mono">${esc(JSON.stringify(m.weights))}</span>`],
+      ])}</div></div>`;
+    if (state.evaluation) renderEvaluation(state.evaluation);
+  } catch (e) { toast("Model info failed: " + e.message, "err"); }
+}
+function renderEvaluation(d) {
+  const s = d.statistical || {};
+  const q = d.sequence || {};
+  if (!s.events) { $("#eval-body").innerHTML = empty("No events to evaluate."); return; }
+  $("#eval-note").textContent = `${fmt(s.events)} events evaluated`;
+  const metric = (k, v) => `<div class="stat"><div class="k">${esc(k)}</div>
+    <div class="v">${Number(v).toFixed(3)}</div></div>`;
+  $("#eval-body").innerHTML = `
+    <div class="grid g-4" style="gap:10px">
+      ${metric("Precision", s.precision)}${metric("Recall", s.recall)}
+      ${metric("F1", s.f1)}${metric("Accuracy", s.accuracy)}
+    </div>
+    <div class="sep"></div>
+    <div class="grid g-2">
+      <div>
+        <h3>Confusion matrix — BN vs burst attacks</h3>
+        <div class="table-wrap" style="max-height:none;margin-top:8px"><table>
+          <thead><tr><th></th><th>pred: attack</th><th>pred: normal</th></tr></thead>
+          <tbody>
+            <tr><th>actual: attack</th><td class="num">${fmt(s.tp)}</td><td class="num">${fmt(s.fn)}</td></tr>
+            <tr><th>actual: normal</th><td class="num">${fmt(s.fp)}</td><td class="num">${fmt(s.tn)}</td></tr>
+          </tbody></table></div>
+      </div>
+      <div>
+        <h3>Layers</h3>
+        ${kvCard([
+          ["Burst attacks (per-event)", `${fmt(s.burst_events)} events`],
+          ["Chain attacks (sequence)", `${fmt(s.chain_events)} events`],
+          ["Flagged by the BN", `${fmt(s.flagged_events)}`],
+          ["Chain events the BN missed", `<b>${fmt(s.chain_flagged)}/${fmt(s.chain_total)}</b> — its blind spot`],
+          ["Chain sessions caught", `${fmt(q.chain_detected)}/${fmt(q.chain_sessions)}`],
+          ["Normal sessions, chain FP", `${fmt(q.false_positives)}/${fmt(q.normal_sessions)}`],
+        ])}
+      </div>
+    </div>`;
+}
+$$("[data-run]").forEach(b => b.addEventListener("click", () => {
+  const what = b.dataset.run;
+  if (what === "train") runJob("/api/model/train", {}, "Train model", reloadAfterJob);
+  if (what === "score") runJob("/api/score-all", { report: $("#score-report").checked }, "Score all events", reloadAfterJob);
+  if (what === "evaluate") runJob("/api/evaluate", {}, "Evaluate detection layers", async res => {
+    if (res) { state.evaluation = res; renderEvaluation(res); }
+    await reloadAfterJob();
+  });
+  if (what === "chains") runJob("/api/chains/scan", { report: $("#chains-report").checked }, "Scan sessions", reloadAfterJob);
+  if (what === "baseline") runJob("/api/baseline/compute", { reset: $("#baseline-reset").checked }, "Compute baseline", reloadAfterJob);
+}));
+
+/* ------------------------------------------------------------------ */
+/* chains                                                              */
+/* ------------------------------------------------------------------ */
+async function loadChains() {
+  try {
+    const d = await api("/api/chains");
+    state.chains = d;
+    const q = d.evaluation || {};
+    const sev = { high: 0, medium: 0 };
+    d.chains.forEach(c => { sev[c.severity] = (sev[c.severity] || 0) + 1; });
+    $("#chain-stats").innerHTML = [
+      ["Chains detected", fmt(d.total), `${fmt(sev.high || 0)} high · ${fmt(sev.medium || 0)} medium`],
+      ["Chain recall", `${fmt(q.chain_detected)}/${fmt(q.chain_sessions)}`, "labeled attack_chain_* sessions"],
+      ["False positives", `${fmt(q.false_positives)}/${fmt(q.normal_sessions)}`, "normal sessions that fired a rule"],
+    ].map(c => `<div class="stat"><div class="k">${esc(c[0])}</div><div class="v">${esc(c[1])}</div><div class="s">${esc(c[2])}</div></div>`).join("");
+
+    $("#chain-rules").innerHTML = `<ul class="clean">` + (d.rules || []).map(r =>
+      `<li><span class="mono">${esc(r.name)}</span> — ${esc(r.doc || "")}</li>`).join("") + `</ul>`;
+    const t = d.tunables || {};
+    $("#chain-tunables").innerHTML = `<h3>Tunables</h3>` + kvCard([
+      ["Chain window", `${t.chain_window_seconds}s`],
+      ["Rapid sweep", `${t.rapid_sweep_files} files / ${t.rapid_sweep_seconds}s`],
+      ["Bulk delete", `${t.bulk_delete_files} distinct files`],
+      ["Cross-artifact", `${t.cross_artifact_count} stores`],
+    ]);
+    const fired = q.by_rule || {};
+    $("#chain-eval").innerHTML = (Object.keys(fired).length
+      ? barsH(Object.entries(fired).map(([k, v]) => ({ label: k, value: v, color: "var(--magenta)" })))
+      : empty("No rules fired on the current dataset.")) +
+      `<div class="legend"><span>chains ${fmt(q.chain_detected)}/${fmt(q.chain_sessions)} caught</span>
+        <span>burst sessions ${fmt(q.burst_detected)}/${fmt(q.burst_sessions)}</span></div>`;
+
+    $("#chain-count").textContent = `${fmt(d.total)} match(es)`;
+    if (!d.chains.length) { $("#chain-table").innerHTML = empty("No chains detected in the stored sessions."); return; }
+    $("#chain-table").innerHTML = `<div class="table-wrap"><table>
+      <thead><tr><th>Severity</th><th>Rule</th><th>Session</th><th>Events</th><th>Description</th><th>Detail</th></tr></thead>
+      <tbody>` + d.chains.map(c => `<tr>
+        <td class="sev-${esc(c.severity)}">${esc(c.severity.toUpperCase())}</td>
+        <td class="mono">${esc(c.rule)}</td>
+        <td class="mono">${esc(c.session_id || "–")}</td>
+        <td class="mono">[${(c.event_ids || []).join(", ")}]</td>
+        <td class="wrap">${esc(c.description)}</td>
+        <td class="wrap">${esc(c.detail || "")}</td></tr>`).join("") + `</tbody></table></div>`;
+  } catch (e) { toast("Chains failed: " + e.message, "err"); }
+}
+
+/* ------------------------------------------------------------------ */
+/* baseline                                                            */
+/* ------------------------------------------------------------------ */
+async function loadBaseline() {
+  try {
+    const d = await api("/api/baseline");
+    $("#baseline-stats").innerHTML = [
+      ["Profiles", fmt(d.total), "artifact × user × process"],
+      ["Events covered", fmt(d.total_events), "sum of access_count"],
+      ["Artifacts", fmt(d.artifacts.length), ""],
+      ["Avg access interval", d.avg_interval === null ? "–" : d.avg_interval + "s", "between consecutive accesses"],
+    ].map(c => `<div class="stat"><div class="k">${esc(c[0])}</div><div class="v">${esc(c[1])}</div><div class="s">${esc(c[2])}</div></div>`).join("");
+    $("#baseline-artifacts").innerHTML = barsH(d.artifacts.map(a => ({ label: a.artifact, value: a.profiles })));
+    $("#baseline-processes").innerHTML = barsH(d.processes.map(p => ({ label: p.process, value: p.profiles, color: "var(--cyan)" })));
+    $("#baseline-note").textContent = d.total ? `${fmt(d.total)} profiles` : "empty — compute the baseline";
+    if (!d.profiles.length) { $("#baseline-table").innerHTML = empty("Baseline is empty — run " + "'Compute baseline'."); return; }
+    const show = d.profiles.slice(0, 300);
+    $("#baseline-table").innerHTML = `<div class="table-wrap"><table>
+      <thead><tr><th>Artifact</th><th>User</th><th>Process</th><th>Accesses</th>
+      <th>First seen</th><th>Last seen</th><th>Normal hours (UTC)</th><th>Avg interval</th></tr></thead>
+      <tbody>` + show.map(p => `<tr>
+        <td class="mono">${esc(p.artifact_path)}</td>
+        <td>${esc(p.user_id)}</td><td>${esc(p.process_name)}</td>
+        <td class="num">${fmt(p.access_count)}</td>
+        <td class="mono">${esc(fmtTime(p.first_seen))}</td>
+        <td class="mono">${esc(fmtTime(p.last_seen))}</td>
+        <td class="mono">${esc((p.normal_hours || []).join(",")) || "–"}</td>
+        <td class="num">${p.avg_access_interval === null || p.avg_access_interval === undefined ? "–" : Number(p.avg_access_interval).toFixed(1) + "s"}</td>
+      </tr>`).join("") + `</tbody></table></div>` +
+      (d.profiles.length > show.length ? `<p class="hint">Showing first ${show.length} of ${fmt(d.profiles.length)} profiles.</p>` : "");
+  } catch (e) { toast("Baseline failed: " + e.message, "err"); }
+}
+$("#baseline-reload").addEventListener("click", loadBaseline);
+
+/* ------------------------------------------------------------------ */
+/* collector                                                           */
+/* ------------------------------------------------------------------ */
+async function loadCollector() {
+  try {
+    const st = await api("/api/collector");
+    $("#collector-state").textContent = st.running ? "running" : "stopped";
+    $("#collector-info").innerHTML = kvCard([
+      ["Status", st.running ? '<span class="badge b-normal">running</span>' : '<span class="badge b-unscored">stopped</span>'],
+      ["Managed by dashboard", st.managed ? `yes (pid ${st.managed_pid})` : "no"],
+      ["Collector PIDs", st.pids && st.pids.length ? `<span class="mono">${st.pids.join(", ")}</span>` : "–"],
+      ["Last exit code", st.exit_code === null || st.exit_code === undefined ? "–" : st.exit_code],
+      ["Log file", `<span class="mono">${esc(st.log)}</span> (${bytes(st.log_size)})`],
+    ]);
+    $("#collector-start").disabled = st.running;
+    $("#collector-stop").disabled = !st.running;
+
+    const p = await api("/api/policy");
+    $("#policy-body").innerHTML = p.error
+      ? `<div class="empty">${esc(p.error)}</div>`
+      : (p.targets.length ? `<div class="table-wrap" style="max-height:260px"><table>
+          <thead><tr><th>Path</th><th>Category</th><th>Recursive</th><th>State</th></tr></thead>
+          <tbody>` + p.targets.map(t => `<tr>
+            <td class="mono">${esc(t.path)}</td><td>${esc(t.category || "")}</td>
+            <td>${t.recursive ? "yes" : "no"}</td>
+            <td>${t.exists ? '<span class="badge b-normal">exists</span>' : '<span class="badge b-unusual">missing</span>'}</td>
+          </tr>`).join("") + `</tbody></table></div>` : empty("No monitoring targets configured."));
+
+    await refreshCollectorLog();
+  } catch (e) { toast("Collector status failed: " + e.message, "err"); }
+}
+async function refreshCollectorLog() {
+  try {
+    const d = await api("/api/collector/log?tail=400");
+    const pre = $("#collector-log");
+    pre.innerHTML = d.lines.length ? d.lines.map(highlightLog).join("\n") : "No collector log yet.";
+    pre.scrollTop = pre.scrollHeight;
+    $("#collector-log-note").textContent = `${d.total_lines} line(s) · ${new Date().toLocaleTimeString()}`;
+    if (state.tab === "collector") {
+      $("#collector-start").disabled = d.status.running;
+      $("#collector-stop").disabled = !d.status.running;
+      $("#collector-state").textContent = d.status.running ? "running" : "stopped";
+    }
+  } catch (e) { /* log polling is best-effort */ }
+}
+function highlightLog(line) {
+  const s = esc(line);
+  if (/RISK ALERT|CHAIN ALERT|\[ERROR\]|\[WARNING\]/.test(line)) return `<span class="l-err">${s}</span>`;
+  if (/Collector started|Real-time scoring enabled|Event #/.test(line)) return `<span class="l-ok">${s}</span>`;
+  if (/WARNING|Skipping/.test(line)) return `<span class="l-warn">${s}</span>`;
+  return s;
+}
+$("#collector-log-refresh").addEventListener("click", refreshCollectorLog);
+$("#collector-start").addEventListener("click", async () => {
+  try { const st = await api("/api/collector/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    toast(st.ready ? "Collector started" : "Collector launched — check the log", st.ready ? "ok" : "info");
+    loadCollector();
+  } catch (e) { toast("Start failed: " + e.message, "err", 9000); }
+});
+$("#collector-stop").addEventListener("click", async () => {
+  try { const r = await api("/api/collector/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    toast(r.stopped && r.stopped.length ? "Collector stopped" : "No collector running", "ok"); loadCollector();
+  } catch (e) { toast("Stop failed: " + e.message, "err"); }
+});
+$("#demo-fast").addEventListener("click", () => runJob("/api/demo", { fast: true, with_metrics: $("#demo-metrics").checked }, "Live demo (fast)", reloadAfterJob));
+$("#demo-full").addEventListener("click", () => runJob("/api/demo", { fast: false, with_metrics: $("#demo-metrics").checked }, "Live demo (full)", reloadAfterJob));
+
+/* ------------------------------------------------------------------ */
+/* alerts + reports                                                    */
+/* ------------------------------------------------------------------ */
+async function loadAlerts() {
+  try {
+    const d = await api("/api/alerts");
+    state.alerts = d;
+    const cfg = d.config || {};
+    $("#sinks-body").innerHTML = `<div class="table-wrap" style="max-height:none"><table>
+      <thead><tr><th>Sink</th><th>Enabled</th><th>Configuration</th></tr></thead><tbody>
+      <tr><td class="mono">stdout</td><td><span class="badge b-normal">always on</span></td>
+          <td class="mono">inline RISK ALERT / CHAIN ALERT log lines</td></tr>
+      <tr><td class="mono">syslog</td>
+          <td><span class="badge ${cfg.syslog && cfg.syslog.enabled ? "b-normal" : "b-unscored"}">${cfg.syslog && cfg.syslog.enabled ? "enabled" : "disabled"}</span></td>
+          <td class="mono">facility ${esc((cfg.syslog && cfg.syslog.facility) || "LOCAL0")}</td></tr>
+      <tr><td class="mono">webhook</td>
+          <td><span class="badge ${cfg.webhook && cfg.webhook.enabled ? "b-normal" : "b-unscored"}">${cfg.webhook && cfg.webhook.enabled ? "enabled" : "disabled"}</span></td>
+          <td class="mono">${esc((cfg.webhook && cfg.webhook.url) || "—")}</td></tr>
+      </tbody></table></div>
+      <p class="hint">Configure in <span class="mono">policy_v2.yaml (alerting:)</span> or via
+      <span class="mono">TDT_SYSLOG_ENABLED</span> / <span class="mono">TDT_WEBHOOK_URL</span>.
+      Sinks are best-effort and never block detection.</p>`;
+
+    const rep = d.report || {};
+    $("#alerts-report-note").textContent = rep.present ? `updated ${fmtTime(rep.mtime)}` : "not generated yet";
+    if (!rep.present) {
+      $("#alerts-summary").innerHTML = empty("Run 'Score all events' with 'write alerts.json' to produce the report.");
+      $("#alerts-table").innerHTML = ""; $("#alerts-count").textContent = "";
+      return;
+    }
+    const sum = rep.summary || {};
+    $("#alerts-summary").innerHTML = `<div class="grid g-4" style="gap:10px">` +
+      ["normal", "unusual", "suspicious", "anomaly"].map(k =>
+        `<div class="stat"><div class="k">${k}</div><div class="v">${fmt(sum[k] || 0)}</div></div>`).join("") +
+      `</div><p class="hint" style="margin-top:10px">${fmt(rep.total_events)} events scored ·
+        ${fmt((rep.alerts || []).length)} alert(s) written to
+        <span class="mono">${esc(rep.path || "alerts.json")}</span></p>`;
+    const alerts = (rep.alerts || []).slice(0, 200);
+    $("#alerts-count").textContent = `${fmt((rep.alerts || []).length)} alert(s)`;
+    $("#alerts-table").innerHTML = alerts.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Event</th><th>Risk</th><th>Level</th><th>Artifact</th><th>Process</th><th>Session</th><th>Explanation</th></tr></thead>
+      <tbody>` + alerts.map(a => `<tr class="clickable" data-event="${a.event_id}">
+        <td class="mono">#${a.event_id}</td><td class="num">${a.risk_score}</td>
+        <td>${badge(a.risk_level)}</td>
+        <td>${esc((a.features || {}).artifact || "–")}</td>
+        <td>${esc((a.features || {}).process || "–")}</td>
+        <td class="mono">${esc((a.features || {}).session_size || "–")} files</td>
+        <td class="wrap">${esc(a.explanation || "")}</td></tr>`).join("") + `</tbody></table></div>`
+      : empty("No alerts in the report.");
+    bindEventRows();
+  } catch (e) { toast("Alerts failed: " + e.message, "err"); }
+}
+function downloadJson(which) {
+  const rep = state.alerts && state.alerts.report;
+  if (which === "alerts" && (!rep || !rep.present)) {
+    toast("alerts.json not generated yet — run 'Score all events'", "err"); return;
+  }
+  api("/api/reports").then(all => {
+    const data = all[which];
+    if (!data || !data.present) {
+      toast(`${which}.json not generated yet`, "err"); return;
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = which + ".json";
+    a.click(); URL.revokeObjectURL(a.href);
+  }).catch(e => toast("Download failed: " + e.message, "err"));
+}
+$("#alerts-download").addEventListener("click", () => downloadJson("alerts"));
+$("#chains-download").addEventListener("click", () => downloadJson("chains"));
+$("#alerts-test").addEventListener("click", () => runJob("/api/alerts/test", {}, "Alert sink self-test", loadAlerts));
+
+/* ------------------------------------------------------------------ */
+/* data                                                            */
+/* ------------------------------------------------------------------ */
+$("#gen-run").addEventListener("click", () => {
+  const seed = Number($("#gen-seed").value) || 0;
+  runJob("/api/generate", { seed, clear: $("#gen-clear").checked }, `Generate dataset (seed ${seed})`, reloadAfterJob);
+});
+$("#pipeline-run").addEventListener("click", () => {
+  const seed = Number($("#gen-seed").value) || 0;
+  runJob("/api/pipeline", { seed }, `Full rebuild (seed ${seed})`, reloadAfterJob);
+});
+$("#upload-run").addEventListener("click", async () => {
+  const file = $("#upload-file").files[0];
+  if (!file) { toast("Choose a CSV or JSON file first", "err"); return; }
+  const analyze = $("#upload-analyze").checked ? "?analyze=1" : "";
+  let text;
+  try { text = await file.text(); } catch (e) { toast("Could not read file", "err"); return; }
+  $("#upload-result").innerHTML = `<div class="hint">Importing <span class="mono">${esc(file.name)}</span>…</div>`;
+  try {
+    const res = await api("/api/upload" + analyze, {
+      method: "POST", headers: { "Content-Type": "text/plain", "X-Filename": file.name }, body: text,
+    });
+    $("#upload-result").innerHTML = kvCard([
+      ["Format detected", esc(res.source)],
+      ["Imported", `<b>${fmt(res.imported)}</b> event(s)`],
+      ["Skipped", fmt(res.skipped)],
+      ["Sessions seen", fmt((res.sessions || []).length)],
+      ["Events now in DB", fmt(res.events_total)],
+    ]) + ((res.errors || []).length
+      ? `<details style="margin-top:8px"><summary>${res.errors.length} row error(s)</summary>
+         <pre class="log">${esc(res.errors.join("\n"))}</pre></details>` : "");
+    toast(`Imported ${res.imported} event(s)`, "ok");
+    if (res.job) await pollJob(res.job.id, "Analyze uploaded events", reloadAfterJob);
+    else reloadAfterJob();
+  } catch (e) {
+    $("#upload-result").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    toast("Upload failed: " + e.message, "err", 9000);
+  }
+});
+$("#db-clear").addEventListener("click", async () => {
+  if (!confirm("Delete ALL events and baseline profiles from collector.db?")) return;
+  try { const r = await api("/api/db/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    toast("Cleared — events: " + r.events + ", baseline: " + r.baseline_profiles, "ok"); reloadAfterJob();
+  } catch (e) { toast("Clear failed: " + e.message, "err"); }
+});
+
+const CLI_MAP = [
+  ["Generate dataset", "python ml/generate_test_events.py --seed 42"],
+  ["Compute baseline", "python baseline.py --reset"],
+  ["Train model", "python ml/anomaly_detector.py train"],
+  ["Score all + report", "python ml/anomaly_detector.py score-all --report"],
+  ["Evaluate", "python ml/anomaly_detector.py evaluate"],
+  ["Explain one event", "python ml/anomaly_detector.py explain <id>"],
+  ["Scan chains", "python sequences.py --json chains.json"],
+  ["Chain evaluation", "python sequences.py --evaluate"],
+  ["Alert sinks", "python alerts.py"],
+  ["Live collector", "python collector.py"],
+  ["Live demo", "./demo.sh --self --with-metrics"],
+  ["Full rebuild", "./run_all.sh --skip-live"],
+  ["Dashboard", "python dashboard.py --open"],
+];
+$("#cli-map").innerHTML = `<div class="table-wrap" style="max-height:none"><table>
+  <thead><tr><th>Dashboard control</th><th>Equivalent CLI</th></tr></thead><tbody>` +
+  CLI_MAP.map(([a, b]) => `<tr><td>${esc(a)}</td><td class="mono">${esc(b)}</td></tr>`).join("") +
+  `</tbody></table></div>`;
+
+/* ------------------------------------------------------------------ */
+/* activity drawer + misc wiring                                       */
+/* ------------------------------------------------------------------ */
+$("#act-open").addEventListener("click", openActivity);
+$("#act-close").addEventListener("click", closeActivity);
+$("#act-clear").addEventListener("click", () => {
+  const keep = {};
+  state.jobOrder.filter(id => state.jobs[id].status === "running").forEach(id => keep[id] = state.jobs[id]);
+  state.jobs = keep; state.jobOrder = Object.keys(keep); renderActivity();
+});
+$("#refresh-btn").addEventListener("click", async () => {
+  toast("Refreshing…", "info", 1500);
+  await reloadAfterJob();
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") $("#modal").classList.add("hidden");
+});
+setInterval(() => {
+  if (state.tab === "collector" && $("#collector-autorefresh").checked) refreshCollectorLog();
+  if (state.tab === "overview" || state.tab === "events") {
+    // Cheap liveness refresh: pills + counts only.
+    api("/api/overview").then(d => { state.overview = d; renderPills(d); }).catch(() => {});
+  }
+}, 10000);
+
+/* boot — deep-linkable tabs: ?tab=events or #events */
+renderActivity();
+const bootTab = new URLSearchParams(location.search).get("tab")
+  || (location.hash || "").replace(/^#/, "")
+  || "overview";
+showTab($(`#tabs button[data-tab="${bootTab}"]`) ? bootTab : "overview");
+window.addEventListener("hashchange", () => {
+  const t = (location.hash || "").replace(/^#/, "");
+  if (t && t !== state.tab && $(`#tabs button[data-tab="${t}"]`)) showTab(t);
+});
+</script>
+</body>
+</html>
